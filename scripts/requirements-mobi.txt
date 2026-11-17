@@ -1,0 +1,2 @@
+mobi==0.4.1
+beautifulsoup4==4.15.0

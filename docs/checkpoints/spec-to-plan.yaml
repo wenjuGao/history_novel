@@ -1,0 +1,63 @@
+metadata:
+  generated: "2026-10-27"
+  source_spec: "docs/spec.md"
+  target_plan: "docs/plan.md"
+  scope: "documentation_traceability_only"
+summary:
+  total_requirements: 45
+  covered_requirements: 45
+  missing_requirements: 0
+  coverage_percentage: 100.0
+requirements:
+  - {req_id: REQ-001, plan_items: ["1.1"]}
+  - {req_id: REQ-002, plan_items: ["2.1"]}
+  - {req_id: REQ-003, plan_items: ["3.1"]}
+  - {req_id: REQ-004, plan_items: ["3.1"]}
+  - {req_id: REQ-005, plan_items: ["3.1"]}
+  - {req_id: REQ-006, plan_items: ["2.1"]}
+  - {req_id: REQ-007, plan_items: ["2.1"]}
+  - {req_id: REQ-008, plan_items: ["2.1"]}
+  - {req_id: REQ-009, plan_items: ["2.1"]}
+  - {req_id: REQ-010, plan_items: ["4.1"]}
+  - {req_id: REQ-011, plan_items: ["2.1"]}
+  - {req_id: REQ-012, plan_items: ["3.1"]}
+  - {req_id: REQ-013, plan_items: ["3.1"]}
+  - {req_id: REQ-014, plan_items: ["3.1"]}
+  - {req_id: REQ-015, plan_items: ["3.1"]}
+  - {req_id: REQ-016, plan_items: ["4.1"]}
+  - {req_id: REQ-017, plan_items: ["4.1"]}
+  - {req_id: REQ-018, plan_items: ["4.1"]}
+  - {req_id: REQ-019, plan_items: ["5.1"]}
+  - {req_id: REQ-020, plan_items: ["5.1"]}
+  - {req_id: REQ-021, plan_items: ["5.1"]}
+  - {req_id: REQ-022, plan_items: ["5.1"]}
+  - {req_id: REQ-023, plan_items: ["5.1"]}
+  - {req_id: REQ-024, plan_items: ["5.1"]}
+  - {req_id: REQ-025, plan_items: ["5.1"]}
+  - {req_id: REQ-026, plan_items: ["6.1"]}
+  - {req_id: REQ-027, plan_items: ["6.1"]}
+  - {req_id: REQ-028, plan_items: ["6.1"]}
+  - {req_id: REQ-029, plan_items: ["6.1"]}
+  - {req_id: REQ-030, plan_items: ["7.1"]}
+  - {req_id: REQ-031, plan_items: ["7.1"]}
+  - {req_id: REQ-032, plan_items: ["7.1"]}
+  - {req_id: REQ-033, plan_items: ["1.1"]}
+  - {req_id: REQ-034, plan_items: ["6.1"]}
+  - {req_id: REQ-035, plan_items: ["7.1"]}
+  - {req_id: REQ-036, plan_items: ["7.1"]}
+  - {req_id: REQ-037, plan_items: ["1.1"]}
+  - {req_id: REQ-038, plan_items: ["8.1"]}
+  - {req_id: REQ-039, plan_items: ["1.1"]}
+  - {req_id: REQ-040, plan_items: ["8.1"]}
+  - {req_id: REQ-041, plan_items: ["2.1"]}
+  - {req_id: REQ-042, plan_items: ["2.1"]}
+  - {req_id: REQ-043, plan_items: ["2.1"]}
+  - {req_id: REQ-044, plan_items: ["1.1"]}
+  - {req_id: REQ-045, plan_items: ["1.1"]}
+missing_requirements: []
+orphan_plan_items: []
+validation:
+  passed: true
+  errors: []
+  warnings: ["本机尚未配置百炼按量 API Key，真实模型联调尚未验证。"]
+  note: "0.3 文档追踪覆盖 45 条需求；仅表示文档映射通过，不表示功能已实现。"

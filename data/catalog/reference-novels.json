@@ -1,0 +1,78 @@
+{
+ "schemaVersion": 1,
+ "usage": "参考小说只用于抽象写作方法（结构、节奏、视角、伏笔、对白功能）；小说原文、段落与专有名词不得进入生成上下文或成品。",
+ "series": [
+  {
+   "key": "a-song-of-ice-and-fire",
+   "name": "冰与火之歌",
+   "aliases": [
+    "权力的游戏",
+    "冰与火之歌·卷一·权力的游戏"
+   ],
+   "default": true,
+   "publisherNote": "乔治·R·R·马丁《冰与火之歌》卷一至卷五，中文译本 MOBI 已在本机转换为纯文本。",
+   "spec": {
+    "path": "data/local/trials/tang-full-reference/writing-spec.md",
+    "origin": "model",
+    "note": "规格由卷一至卷五全文分段分析（qwen3.8-flash，2026-10-28 试跑）提炼，只保留抽象写作方法。"
+   },
+   "volumes": [
+    {
+     "order": 1,
+     "volume": "卷一",
+     "title": "冰与火之歌·卷一·权力的游戏",
+     "sourceName": "冰与火之歌·卷一·权力的游戏.mobi",
+     "sourceSha256": "1c678b3827dcb9bc69a28f8c5aabcafaf019a098f483dc7eff6d3fa10d4eec3e",
+     "textSha256": "d4fa395b455fa6991a711dd888677616681004e3f084951e01e7eadee904d5ac",
+     "characters": 550860,
+     "bytes": 7828395,
+     "tocEntries": 86
+    },
+    {
+     "order": 2,
+     "volume": "卷二",
+     "title": "冰与火之歌·卷二·列王的纷争",
+     "sourceName": "冰与火之歌·卷二·列王的纷争.mobi",
+     "sourceSha256": "ee8ce47c7152c284458980d3088e318b19b0c6ec555dd9cb4024f23a66dce5a7",
+     "textSha256": "bc4d9bac1058a8697f8637c8782d76d4b4e8dce5eeb2b56254335353c844fb86",
+     "characters": 572433,
+     "bytes": 6790870,
+     "tocEntries": 81
+    },
+    {
+     "order": 3,
+     "volume": "卷三",
+     "title": "冰与火之歌·卷三·冰雨的风暴",
+     "sourceName": "冰与火之歌·卷三·冰雨的风暴.mobi",
+     "sourceSha256": "908f11308ec5d14861169c210d027beccc595b9d920e912e9a4e6efa3741d26b",
+     "textSha256": "a025cac875fc8f36c4203781d583b46797e0fe5f744ad98b3f7e6c221d97ad4b",
+     "characters": 721291,
+     "bytes": 5801810,
+     "tocEntries": 93
+    },
+    {
+     "order": 4,
+     "volume": "卷四",
+     "title": "冰与火之歌·卷四·群鸦的盛宴",
+     "sourceName": "冰与火之歌·卷四·群鸦的盛宴.mobi",
+     "sourceSha256": "9be19ef4795637ec591924a2502079023d63e4405fd928e543d710406122e8b2",
+     "textSha256": "dc3fc2e4ef856ab7ee9cf08cf7fb909e490c8a593148c9a010f740f4d3391037",
+     "characters": 523985,
+     "bytes": 8392004,
+     "tocEntries": 58
+    },
+    {
+     "order": 5,
+     "volume": "卷五",
+     "title": "冰与火之歌·卷五·魔龙的狂舞",
+     "sourceName": "冰与火之歌·卷五·魔龙的狂舞.mobi",
+     "sourceSha256": "53b4ef39b9b7523f0a5335d03e2a9b9d5be72f1ba4df3792c9d0be43d58a5a2a",
+     "textSha256": "1489b5d4c9e79e9705f81cd0ef7031292054165de893709a60d54b5d4b9cd387",
+     "characters": 716374,
+     "bytes": 4938737,
+     "tocEntries": 85
+    }
+   ]
+  }
+ ]
+}

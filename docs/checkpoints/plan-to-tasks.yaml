@@ -1,0 +1,68 @@
+metadata:
+  generated: "2026-10-27"
+  source_plan: "docs/plan.md"
+  target_tasks: "docs/plan.md"
+  scope: "documentation_traceability_only"
+summary:
+  total_plan_items: 8
+  covered_plan_items: 8
+  missing_plan_items: 0
+  coverage_percentage: 100.0
+  total_tasks_generated: 32
+  orphan_tasks: 0
+phases:
+  - phase_id: "Phase-1"
+    phase_name: "本地基础与商业调用入口"
+    items:
+      - item_id: "1.1"
+        requirements: [REQ-001, REQ-033, REQ-037, REQ-039, REQ-044, REQ-045]
+        tasks: [T001, T002, T003, T029]
+  - phase_id: "Phase-2"
+    phase_name: "古籍采集、资料导入与证据核定"
+    items:
+      - item_id: "2.1"
+        requirements: [REQ-002, REQ-006, REQ-007, REQ-008, REQ-009, REQ-011, REQ-041, REQ-042, REQ-043]
+        tasks: [T004, T005, T006, T007, T030, T031, T032]
+  - phase_id: "Phase-3"
+    phase_name: "时间区域选人及关联检查"
+    items:
+      - item_id: "3.1"
+        requirements: [REQ-003, REQ-004, REQ-005, REQ-012, REQ-013, REQ-014, REQ-015]
+        tasks: [T008, T009, T010, T011]
+  - phase_id: "Phase-4"
+    phase_name: "写作规格与虚构设定"
+    items:
+      - item_id: "4.1"
+        requirements: [REQ-010, REQ-016, REQ-017, REQ-018]
+        tasks: [T012, T013, T014]
+  - phase_id: "Phase-5"
+    phase_name: "情节规划、预览与强制确认"
+    items:
+      - item_id: "5.1"
+        requirements: [REQ-019, REQ-020, REQ-021, REQ-022, REQ-023, REQ-024, REQ-025]
+        tasks: [T015, T016, T017, T018]
+  - phase_id: "Phase-6"
+    phase_name: "章节生成、校验与连续性"
+    items:
+      - item_id: "6.1"
+        requirements: [REQ-026, REQ-027, REQ-028, REQ-029, REQ-034]
+        tasks: [T019, T020, T021, T022]
+  - phase_id: "Phase-7"
+    phase_name: "持久化任务、费用与真实接入"
+    items:
+      - item_id: "7.1"
+        requirements: [REQ-030, REQ-031, REQ-032, REQ-035, REQ-036]
+        tasks: [T023, T024, T025]
+  - phase_id: "Phase-8"
+    phase_name: "备份导出、体验与交付"
+    items:
+      - item_id: "8.1"
+        requirements: [REQ-038, REQ-040]
+        tasks: [T026, T027, T028]
+missing_plan_items: []
+orphan_tasks: []
+validation:
+  passed: true
+  errors: []
+  warnings: ["真实模型调用需用户自行配置 DASHSCOPE_API_KEY；暂无 Key，未执行外网联调。"]
+  note: "文档映射通过；已完成 T001-T002、T030-T031。古籍校验通过：25部、3,563/3,563卷页、0错误；T032全文索引尚未开始。"
