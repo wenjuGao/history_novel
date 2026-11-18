@@ -3,8 +3,10 @@ import 'server-only'
 import { randomUUID } from 'node:crypto'
 import { db } from '@/lib/db'
 import { assertEvidenceInSource, corpusBooksOverlappingScope, corpusDocumentIds, pinCorpus } from '@/lib/source-text'
+import { personProfiles, profileInScope, profileSpan, yearsIndexReady, type PersonProfile } from '@/lib/person-years'
 
-// 史料人物候选：把启发式索引（corpus_person / corpus_person_edge）按当前时间阶段收敛、打分并标出强关联。
+// 史料人物候选：把启发式索引（corpus_person / corpus_person_edge）按当前时间阶段收敛、打分并标出强关联，
+// 再用预处理出的人物年份档案（corpus_person_profile）按「生卒／活动区间与范围有交集」筛出确定候选。
 // 这些只是「待确认候选」，写入 characters 时一律 review_status='auto'，不等于已核定的史实。
 
 export type CorpusPersonCandidate = {
@@ -21,6 +23,9 @@ export type CorpusPersonCandidate = {
 	evidenceBookName: string
 	evidenceVolume: string
 	evidenceUrl: string
+	/** in-range：区间与范围有交集；unknown：没有年份档案或区间不可信，只能人工核对。 */
+	yearState: 'in-range' | 'unknown' | 'out-of-range'
+	profile: PersonProfile | null
 }
 
 // 强关联判定阈值：同一条关系在正文中共现次数与跨卷数都要成立，避免单段引文造成的假连接。
@@ -137,7 +142,7 @@ export function corpusBooksForScope(projectId: string) {
 	return scope ? corpusBooksOverlappingScope(scope.startYear, scope.endYear) : corpusBooksOverlappingScope(-4000, 4000)
 }
 
-function aggregate(bookIds: string[], limit: number, blocked: Set<string>) {
+function aggregate(bookIds: string[], blocked: Set<string>) {
 	const placeholders = bookIds.map(() => '?').join(',')
 	const personRows = db
 		.prepare(
@@ -195,20 +200,49 @@ function aggregate(bookIds: string[], limit: number, blocked: Set<string>) {
 			evidenceBookName: entry.best.book_name,
 			evidenceVolume: entry.best.evidence_volume,
 			evidenceUrl: entry.best.evidence_url,
+			yearState: 'unknown',
+			profile: null,
 		})
 	}
 	candidates.sort((a, b) => b.score - a.score || b.mentions - a.mentions || a.name.localeCompare(b.name, 'zh'))
-	return candidates.slice(0, limit)
+	return candidates
+}
+
+// 年份判定在收敛之后做：档案来自 corpus:years 预处理，范围只在读取时用作过滤条件。
+function attachYearState(candidates: CorpusPersonCandidate[], scope: { startYear: number; endYear: number } | null) {
+	const profiles = personProfiles(candidates.map((candidate) => candidate.name))
+	for (const candidate of candidates) {
+		const profile = profiles.get(candidate.name) ?? null
+		candidate.profile = profile
+		// 没有范围时不做年份筛选，但仍带出生卒与事迹供人工判断。
+		const verdict = !scope ? true : profileInScope(profile ?? undefined, scope.startYear, scope.endYear)
+		// 区间外与年份不明要分开：前者不是「待核」，而是本阶段不该出现的人（REQ-062）。
+		candidate.yearState = verdict === true ? 'in-range' : verdict === false ? 'out-of-range' : 'unknown'
+	}
+	return { candidates, profiles }
+}
+
+export function projectScopeYears(projectId: string) {
+	const scope = db.prepare('SELECT start_year AS startYear, end_year AS endYear FROM project_scope WHERE project_id = ?').get(projectId) as
+		| { startYear: number; endYear: number }
+		| undefined
+	return scope ?? null
 }
 
 export function corpusPersonCandidates(projectId: string, { limit = 120 }: { limit?: number } = {}) {
 	const books = corpusBooksForScope(projectId)
+	const scope = projectScopeYears(projectId)
 	const blocked = new Set((db.prepare('SELECT name FROM corpus_person_blocks WHERE project_id = ?').all(projectId) as Array<{ name: string }>).map((row) => row.name))
 	const maxCharacters = (db.prepare('SELECT max_characters AS max FROM project_auto_settings WHERE project_id = ?').get(projectId) as { max: number } | undefined)?.max ?? 12
-	if (!books.length) return { books, candidates: [] as CorpusPersonCandidate[], defaults: [] as string[], blocked: [...blocked] }
-	const candidates = aggregate(books.map((book) => book.id), limit, blocked)
+	const empty = { books, candidates: [] as CorpusPersonCandidate[], pending: [] as CorpusPersonCandidate[], defaults: [] as string[], blocked: [...blocked], ready: yearsIndexReady() }
+	if (!books.length) return empty
+	const all = aggregate(books.map((book) => book.id), blocked)
+	attachYearState(all, scope)
+	// 确定候选只保留生活在区间内的人；年份不明者单列待核，不混入确定匹配（REQ-004）。
+	const candidates = all.filter((candidate) => candidate.yearState === 'in-range').slice(0, limit)
+	const pending = all.filter((candidate) => candidate.yearState === 'unknown').slice(0, 60)
 	const defaults = candidates.filter((candidate) => candidate.strong).slice(0, maxCharacters).map((candidate) => candidate.name)
-	return { books, candidates, defaults, blocked: [...blocked] }
+	return { books, candidates, pending, defaults, blocked: [...blocked], ready: yearsIndexReady() }
 }
 
 // 把候选写入本项目：证据必须能在校验路径上命中原文，否则整条跳过（不静默放行）。
@@ -217,13 +251,12 @@ export function importCorpusPersons(projectId: string, names: string[], { select
 	if (names.length > 60) throw new Error('单次导入最多 60 位史料人物。')
 	const pinning = pinCorpusIfMissing(projectId)
 	const documentsByBook = new Map(corpusDocumentIds(projectId, pinning.books.map((book) => book.id)).map((row) => [row.bookId, row.id]))
-	const bookYears = new Map(pinning.books.map((book) => [book.id, { startYear: book.startYear, endYear: book.endYear }]))
 	const scope = db.prepare('SELECT start_year AS startYear, end_year AS endYear, region FROM project_scope WHERE project_id = ?').get(projectId) as
 		| { startYear: number; endYear: number; region: string }
 		| undefined
 	const existing = new Set((db.prepare('SELECT name FROM characters WHERE project_id = ?').all(projectId) as Array<{ name: string }>).map((row) => row.name))
-	const { candidates } = corpusPersonCandidates(projectId, { limit: 600 })
-	const byName = new Map(candidates.map((candidate) => [candidate.name, candidate]))
+	const { candidates, pending } = corpusPersonCandidates(projectId, { limit: 600 })
+	const byName = new Map([...candidates, ...pending].map((candidate) => [candidate.name, candidate]))
 	const now = new Date().toISOString()
 	const inserted: string[] = []
 	const skipped: Array<{ name: string; reason: string }> = []
@@ -247,13 +280,16 @@ export function importCorpusPersons(projectId: string, names: string[], { select
 			db.prepare(
 				'INSERT INTO characters (id, project_id, name, document_id, evidence, selected, created_at, review_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
 			).run(characterId, projectId, name, documentId, candidate.evidence, selectedNames.has(name) ? 1 : 0, now, 'auto')
-			if (scope) {
-				const region = scope.region.split(/[、,，]/).map((value) => value.trim()).filter(Boolean)[0] ?? ''
-				// 活动时间不再用作品年份代填：先取证据所在书目的年代范围（语料无人物级年份，属近似值，仍待人工核对）。
-				const years = bookYears.get(candidate.evidenceBook)
-				const startYear = years?.startYear ?? scope.startYear
-				const endYear = years?.endYear ?? scope.endYear
-				db.prepare('INSERT OR IGNORE INTO character_activity VALUES (?,?,?,?)').run(characterId, Math.min(startYear, endYear), Math.max(startYear, endYear), region)
+			// 活动年份只取人物年份档案：无档案或区间不可信时留空，交人工在资料步骤补填（REQ-054）。
+			const span = candidate.profile?.plausible ? profileSpan(candidate.profile) : null
+			if (span) {
+				const region = scope?.region.split(/[、,，]/).map((value) => value.trim()).filter(Boolean)[0] ?? ''
+				db.prepare('INSERT OR IGNORE INTO character_activity VALUES (?,?,?,?)').run(
+					characterId,
+					Math.min(span.start, span.end),
+					Math.max(span.start, span.end),
+					region,
+				)
 			}
 			inserted.push(name)
 		}

@@ -8,6 +8,7 @@ import { buildGenerationContext, derivedCandidates, outlineEvidence } from '@/li
 import { proposalGateReason, stampProposal } from '@/lib/proposal-binding'
 import { assertEvidenceInSource, corpusDocumentIds } from '@/lib/source-text'
 import { generateOutline, OutlineError } from '@/lib/outline-generate'
+import { MAX_PLAN_CHAPTERS } from '@/lib/plan-limits'
 import { commitPlan, readPlan, sha256, validPlan, type StoryPlan } from '@/lib/story-plan'
 import { db } from '@/lib/db'
 
@@ -117,7 +118,7 @@ export async function confirmAndGenerate(projectId: string, input: AutoSetupInpu
 	const region = typeof input.region === 'string' ? input.region.trim().slice(0, 200) : ''
 	if (!region) throw new Error('请填写地域范围。')
 	const plannedChapters = input.plannedChapters === undefined ? 8 : Number(input.plannedChapters)
-	if (!Number.isInteger(plannedChapters) || plannedChapters < 1 || plannedChapters > 24) throw new Error('计划章节数需为 1 至 24 的整数。')
+	if (!Number.isInteger(plannedChapters) || plannedChapters < 1 || plannedChapters > MAX_PLAN_CHAPTERS) throw new Error(`计划章节数需为 1 至 ${MAX_PLAN_CHAPTERS} 的整数。`)
 	const maxEvents = Math.min(Math.max(Number(input.maxEvents ?? maxAdoptedEvents) || maxAdoptedEvents, 1), maxAdoptedEvents)
 
 	const steps: AutoSetupStep[] = []
@@ -140,8 +141,9 @@ export async function confirmAndGenerate(projectId: string, input: AutoSetupInpu
 	let importFailed = false
 	try {
 		const wanted = Array.isArray(input.characterNames) ? input.characterNames.map((name) => String(name).trim()).filter(Boolean) : []
-		const names = wanted.length ? [...new Set(wanted)].slice(0, 60) : corpusPersonCandidates(projectId, { limit: 200 }).defaults
-		if (!names.length) throw new Error('当前时间阶段没有可导入的史料人物候选。')
+		const { defaults, ready } = corpusPersonCandidates(projectId, { limit: 200 })
+		const names = wanted.length ? [...new Set(wanted)].slice(0, 60) : defaults
+		if (!names.length) throw new Error(ready ? '当前时间阶段没有可导入的史料人物候选。' : '人物年份档案尚未预处理，请先在终端执行 npm run corpus:years。')
 		const result = importCorpusPersons(projectId, names, { selectedNames: new Set(names) })
 		characters.imported = result.inserted
 		characters.skipped = result.skipped

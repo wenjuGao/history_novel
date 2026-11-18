@@ -826,7 +826,8 @@ if (process.env.CREATION_CHAIN_FIXTURE === '1') {
 		assert.deepEqual(legacyState.evidenceIssues, [], '核对完成后不再有等待项')
 		const legacyConfirmed = { version: legacyState.version, planHash: legacyState.planHash }
 		await call(legacyProject.routes.story, { ...legacyConfirmed, action: 'approve', allowExternalTransfer: true, evidenceConfirmed: true })
-		await call(legacyProject.routes.story, { ...legacyConfirmed, chapterId: legacyOne, action: 'generate' }, 202)
+		// 改版把第一章已接受正文按章节继承到新版本，因此重写它要走显式「重新生成」并确认覆盖，而不是普通生成。
+		await call(legacyProject.routes.story, { ...legacyConfirmed, chapterId: legacyOne, action: 'regenerate', regenerateConfirmed: true }, 202)
 		await waitFor(legacyProject.routes.story, legacyOne, 'draft')
 		await call(legacyProject.routes.story, { ...legacyConfirmed, chapterId: legacyOne, action: 'accept' })
 		await call(legacyProject.routes.story, { ...legacyConfirmed, chapterId: legacyTwo, action: 'generate' }, 202)

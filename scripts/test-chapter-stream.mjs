@@ -114,8 +114,11 @@ if (process.env.STORY_STREAM_FIXTURE === '1') {
 
 	// 默认建一个空目录自检；传入 HISTORY_DATA_DIR（例如从真实库做的在线备份）时复用它，
 	// 这样本机已登记的古籍与参考小说会参与项目自动固定，规格门禁与请求规格断言走真实分支。
-	const seeded = process.env.HISTORY_DATA_DIR
-	const directory = seeded ?? mkdtempSync(path.join(os.tmpdir(), 'story-stream-'))
+	// 空串要按未设置处理：服务端用 `||` 判空，`HISTORY_DATA_DIR=` 会让测试作品写进真实 data/local。
+	const seeded = process.env.HISTORY_DATA_DIR?.trim()
+	const directory = seeded ? path.resolve(seeded) : mkdtempSync(path.join(os.tmpdir(), 'story-stream-'))
+	assert.notEqual(directory, path.resolve(process.cwd()), 'HISTORY_DATA_DIR 不能是仓库目录，请指向隔离副本或留空自建临时目录。')
+	assert.notEqual(directory, path.resolve(process.cwd(), 'data', 'local'), 'HISTORY_DATA_DIR 不能指向真实工作区 data/local。')
 	const socket = createServer()
 	socket.listen(0, '127.0.0.1')
 	await once(socket, 'listening')
@@ -172,9 +175,9 @@ if (process.env.STORY_STREAM_FIXTURE === '1') {
 		await exited
 	}
 
-	async function call(route, body, expected = 200) {
+	async function call(route, body, expected = 200, method) {
 		const response = await fetch(base + route, {
-			method: body === undefined ? 'GET' : 'POST',
+			method: method ?? (body === undefined ? 'GET' : 'POST'),
 			headers: { origin: base, 'content-type': 'application/json' },
 			body: body === undefined ? undefined : JSON.stringify(body)
 		})
@@ -357,8 +360,64 @@ if (process.env.STORY_STREAM_FIXTURE === '1') {
 			.get(testProjectId, one)
 		assert.equal(trace.stateHash, trace.draftHash, '已确认状态记录的输入版本就是本章当前正文的版本')
 		database.close()
+
+		// 章纲改版（含「AI 续设下一章」后保存目录）不得重置已确认章节：正文与已固化故事状态按章节继承到新版本。
+		// 先把上一段落下的两处待复核复核完，让新版本继承一个「全部已接受」的完整前缀。
+		await call(route, { ...request, chapterId: two, action: 'accept' })
+		await call(route, { ...request, chapterId: three, action: 'accept' })
+		state = await call(route)
+		const editedOne = `${partial + suffix}前章改写后的新结尾。`
+		const revisedPlan = structuredClone(state.plan)
+		revisedPlan.chapters[2].synopsis = `${revisedPlan.chapters[2].synopsis}（改版后重写的本章情节）`
+		revisedPlan.chapters.push({ ...structuredClone(revisedPlan.chapters[3]), id: 'chapter-05', title: 'AI 续设的下一章' })
+		revisedPlan.scope.plannedChapters = revisedPlan.chapters.length
+		const resaved = await call(route, { plan: revisedPlan, expectedVersion: state.version }, 200, 'PUT')
+		assert.equal(resaved.version, state.version + 1, '保存章纲产生新版本')
+		assert.deepEqual(
+			{ carried: resaved.carried, preserved: resaved.preserved, needsReview: resaved.needsReview },
+			{ carried: 3, preserved: 2, needsReview: 1 },
+			'已接受正文与故事状态逐章继承，章纲改写的那章转为待复核'
+		)
+		state = await call(route)
+		const requestV2 = { version: state.version, planHash: state.planHash }
+		const storyState = (id) => state.storyStates.find((item) => item.chapterId === id)
+		assert.equal(state.approval, null, '新版仍撤销方案级确认（REQ-051）')
+		assert.equal(chapter(one).status, 'accepted')
+		assert.equal(chapter(one).needsReview, 0, '章纲未改写且前序完整的前章保持已确认')
+		assert.equal(chapter(one).content, editedOne, '已接受正文原样带入新版本，不重写也不清空')
+		assert.equal(storyState(one).status, 'confirmed', '已固化的故事状态沿用')
+		assert.equal(chapter(two).content, autoSegments.slice(0, 3).join(''), '章二正文不变')
+		assert.equal(storyState(two).status, 'confirmed')
+		assert.equal(chapter(three).content, repeated + manualFinish, '改写章纲的本章保留原正文')
+		assert.equal(chapter(three).needsReview, 1)
+		assert.match(chapter(three).reviewReason, /章纲/)
+		assert.equal(storyState(three).status, 'stale', '待复核章节的故事状态不进入新请求')
+		assert.equal(state.storyStates.length, 3, '只继承有正文的章节状态')
+		assert.ok(!chapter(four), '中断章不在新版本生成草稿，旧版本的请求与正文仍可核对')
+		assert.ok(!chapter('chapter-05'), 'AI 续设的新章节以未生成加入新版本')
+
+		// 队列口径在 API 侧同样成立：未重新确认不放行、前章待复核不放行、草稿不完整不自动接受。
+		const unapproved = await call(route, { ...requestV2, chapterId: four, action: 'generate' }, 409)
+		assert.match(unapproved.error, /确认/)
+		await call(route, { ...requestV2, action: 'approve', allowExternalTransfer: true, evidenceConfirmed: true })
+		const pendingReview = await call(route, { ...requestV2, chapterId: four, action: 'generate' }, 409)
+		assert.match(pendingReview.error, /待复核/)
+		await call(route, { ...requestV2, chapterId: three, action: 'accept' })
+		state = await call(route)
+		assert.equal(chapter(three).needsReview, 0, '复核即重新接受，无需重写正文')
+		assert.equal(storyState(three).status, 'confirmed')
+		await call(route, { ...requestV2, chapterId: four, action: 'generate' }, 202)
+		state = await waitForChapter(route, four, 'failed-or-unknown')
+		assert.ok(chapter(four).content.length > 0, '新版首次请求同样落检查点正文')
+		await call(route, { ...requestV2, chapterId: four, action: 'accept' }, 409)
+		assert.deepEqual(
+			Object.fromEntries([...sentByChapter()].map(([id, items]) => [id, items.length])),
+			{ [one]: 2, [two]: 3, [three]: 3, [four]: 6 },
+			'改版后队列只对未生成的章节发起任务，已接受章节一次都不重发'
+		)
+
 		console.log(
-			'PASS: HTTP 202 background stream, disconnect checkpoint, server restart, explicit continuation, accepted story state fed to the next chapter, bounded auto-continuation with duplicate rollback and cap, downstream review marking; provider network replaced by fixture.'
+			'PASS: HTTP 202 background stream, disconnect checkpoint, server restart, explicit continuation, accepted story state fed to the next chapter, bounded auto-continuation with duplicate rollback and cap, downstream review marking, plan revision carrying accepted text and story state forward chapter by chapter; provider network replaced by fixture.'
 		)
 	} catch (error) {
 		console.error(logs)

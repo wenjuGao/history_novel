@@ -67,7 +67,7 @@ export function ScopePanel({
 			});
 			const result = (await response.json()) as { error?: string };
 			if (!response.ok) throw new Error(result.error ?? "保存失败。");
-			setMessage("历史范围已保存，人物候选与关联已重新检查。");
+			setMessage("历史范围已保存，候选名单按新区间重新查询。");
 			onSaved?.();
 		} catch (cause) {
 			setMessage(cause instanceof Error ? cause.message : "保存失败。");
@@ -79,7 +79,7 @@ export function ScopePanel({
 	return (
 		<section className="flex flex-col gap-3" aria-label="历史范围">
 			<p className="text-[12px] leading-relaxed text-muted-foreground">
-				使用历史纪年，公元前填负数，没有公元 0 年。范围决定人物候选与事件筛选。
+				使用历史纪年，公元前填负数，没有公元 0 年。范围只用于查询已预处理的人物年份档案与带年纪事，保存不会触发生成。
 			</p>
 
 			{loading ? (
@@ -117,13 +117,12 @@ export function ScopePanel({
 						</label>
 					</div>
 					<label className="flex flex-col gap-1.5">
-						<Label htmlFor="scope-region">区域</Label>
+						<Label htmlFor="scope-region">区域（可留空）</Label>
 						<Input
 							id="scope-region"
-							required
 							maxLength={200}
 							value={scope.region}
-							placeholder="例如：关中、江南"
+							placeholder="例如：关中、江南；留空表示不限区域"
 							onChange={(event) => setScope({ ...scope, region: event.target.value })}
 						/>
 					</label>

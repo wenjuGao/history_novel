@@ -280,6 +280,33 @@ function attemptSpent(projectId: string, planVersion: number): { spentTokens: nu
   };
 }
 
+// REQ-060：重新生成与恢复都会覆盖本章已保存正文，覆盖前把整行正文原样归档。归档只追加不改写，
+// 恢复同样先归档当前正文，因此任何一次点击都不会静默丢字。必须在写事务内调用才能与覆盖同生同灭。
+function archiveDraft(projectId: string, planVersion: number, chapterId: string, reason: string, now: string) {
+  const draft = db
+    .prepare(
+      "SELECT chapter_title AS chapterTitle, content, meta_json AS metaJson, status, input_hash AS inputHash, request_id AS requestId FROM chapter_drafts WHERE project_id = ? AND plan_version = ? AND chapter_id = ?",
+    )
+    .get(projectId, planVersion, chapterId) as
+    | { chapterTitle: string; content: string; metaJson: string | null; status: string; inputHash: string; requestId: string | null }
+    | undefined;
+  if (!draft || !draft.content.trim()) return false;
+  db.prepare(
+    "INSERT INTO chapter_draft_backups(id, project_id, plan_version, chapter_id, chapter_title, content, meta_json, status, input_hash, request_id, reason, archived_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  ).run(randomUUID(), projectId, planVersion, chapterId, draft.chapterTitle, draft.content, draft.metaJson, draft.status, draft.inputHash, draft.requestId, reason, now);
+  return true;
+}
+
+function latestDraftBackup(projectId: string, planVersion: number, chapterId: string) {
+  return db
+    .prepare(
+      "SELECT id, chapter_id AS chapterId, chapter_title AS chapterTitle, content, meta_json AS metaJson, status, input_hash AS inputHash, reason, archived_at AS archivedAt FROM chapter_draft_backups WHERE project_id = ? AND plan_version = ? AND chapter_id = ? ORDER BY archived_at DESC LIMIT 1",
+    )
+    .get(projectId, planVersion, chapterId) as
+    | { id: string; chapterId: string; chapterTitle: string; content: string; metaJson: string | null; status: string; inputHash: string | null; reason: string; archivedAt: string }
+    | undefined;
+}
+
 export async function GET(request: NextRequest, context: Context) {
   if (!isLoopbackRequest(request)) return NextResponse.json({ error: "仅允许本机访问。" }, { status: 403 });
   const { id } = await context.params;
@@ -287,6 +314,12 @@ export async function GET(request: NextRequest, context: Context) {
 
   try {
     const row = readPlan(id);
+    // 单章归档原文按需读取（界面上的「查看上一版正文」），不随整页轮询一起下发，避免把全部旧稿塞进每次 GET。
+    const backupChapterId = new URL(request.url).searchParams.get("backup");
+    if (backupChapterId) {
+      if (!row) return NextResponse.json({ error: "这部作品还没有故事规划。" }, { status: 404 });
+      return NextResponse.json({ backup: latestDraftBackup(id, row.version, backupChapterId) ?? null }, { headers: { "cache-control": "no-store" } });
+    }
     if (!row) return NextResponse.json({ version: 0, planHash: null, plan: null, estimate: null, approval: null, usage: { spentTokens: 0, spentCny: 0 }, chapters: [], storyStates: [], autoContinuationLimit: maxAutoContinuations, blocked: outlineBlockReason(id), proposalIssue: null, evidence: [], evidenceIssues: [], specNotice: null }, { headers: { "cache-control": "no-store" } });
     const staleBefore = new Date(Date.now() - 150_000).toISOString();
     const staleDrafts = db.prepare("SELECT chapter_id AS chapterId, plan_version AS planVersion FROM chapter_drafts WHERE project_id = ? AND status = 'generating' AND updated_at < ?").all(id, staleBefore) as Array<{ chapterId: string; planVersion: number }>;
@@ -319,7 +352,10 @@ export async function GET(request: NextRequest, context: Context) {
         (SELECT COUNT(*) FROM chapter_generation_attempts a WHERE a.project_id=d.project_id AND a.plan_version=d.plan_version AND a.chapter_id=d.chapter_id AND a.initiator='auto-continuation') AS autoContinuationCount,
         (SELECT COALESCE(SUM(a.estimated_cost_cny), 0) FROM chapter_generation_attempts a WHERE a.project_id=d.project_id AND a.plan_version=d.plan_version AND a.chapter_id=d.chapter_id) AS reservedCostCny,
         (SELECT COUNT(*) FROM chapter_generation_attempts a WHERE a.project_id=d.project_id AND a.plan_version=d.plan_version AND a.chapter_id=d.chapter_id) AS attemptCount,
-        (SELECT a.status FROM chapter_generation_attempts a WHERE a.project_id=d.project_id AND a.plan_version=d.plan_version AND a.chapter_id=d.chapter_id ORDER BY a.attempt_number DESC LIMIT 1) AS latestAttemptStatus
+        (SELECT a.status FROM chapter_generation_attempts a WHERE a.project_id=d.project_id AND a.plan_version=d.plan_version AND a.chapter_id=d.chapter_id ORDER BY a.attempt_number DESC LIMIT 1) AS latestAttemptStatus,
+        (SELECT COUNT(*) FROM chapter_draft_backups b WHERE b.project_id=d.project_id AND b.plan_version=d.plan_version AND b.chapter_id=d.chapter_id) AS backupCount,
+        (SELECT b.archived_at FROM chapter_draft_backups b WHERE b.project_id=d.project_id AND b.plan_version=d.plan_version AND b.chapter_id=d.chapter_id ORDER BY b.archived_at DESC LIMIT 1) AS backupAt,
+        (SELECT LENGTH(b.content) FROM chapter_draft_backups b WHERE b.project_id=d.project_id AND b.plan_version=d.plan_version AND b.chapter_id=d.chapter_id ORDER BY b.archived_at DESC LIMIT 1) AS backupChars
       FROM chapter_drafts d WHERE d.project_id = ? AND d.plan_version = ? ORDER BY d.created_at, d.chapter_id
     `).all(id, row.version);
     return NextResponse.json({ version: row.version, planHash: row.plan_hash, plan, estimate, usage: attemptSpent(id, row.version), evidence, evidenceIssues, specNotice, proposalIssue: planProposalIssue(id, plan), blocked: trial ? null : SNAPSHOT_MISSING_ISSUE, approval: approval ?? null, storyStates: listChapterStates(id, row.version), autoContinuationLimit: maxAutoContinuations, chapters }, { headers: { "cache-control": "no-store" } });
@@ -355,8 +391,8 @@ export async function PUT(request: NextRequest, context: Context) {
   const plan = stampProposal(id, { ...body.plan, generationContext: snapshotContext });
   if (Buffer.byteLength(JSON.stringify(plan), "utf8") > 250_000) return NextResponse.json({ error: "规划内容过大。" }, { status: 413 });
   try {
-    const { version, planHash } = commitPlan(id, plan, body.expectedVersion);
-    return NextResponse.json({ version, planHash, approval: null, chapters: [] });
+    const { version, planHash, carried, preserved, needsReview } = commitPlan(id, plan, body.expectedVersion);
+    return NextResponse.json({ version, planHash, approval: null, chapters: [], carried, preserved, needsReview });
   } catch (error) {
     if (error instanceof PlanVersionError) return NextResponse.json({ error: error.message }, { status: 409 });
     const message = error instanceof Error ? error.message : "无法保存规划。";
@@ -468,9 +504,35 @@ export async function POST(request: NextRequest, context: Context) {
     return NextResponse.json({ saved: true, chapterId });
   }
 
-  if (body.action !== "generate" && body.action !== "retry" && body.action !== "resume") return NextResponse.json({ error: "未知操作。" }, { status: 400 });
+  // REQ-060：恢复只把归档正文写回本章草稿，不发出任何模型请求；当前正文先归档，因此来回切换都不丢字。
+  if (body.action === "restore") {
+    const current = db.prepare("SELECT status, content FROM chapter_drafts WHERE project_id = ? AND plan_version = ? AND plan_hash = ? AND chapter_id = ?").get(id, row.version, row.plan_hash, chapterId) as { status: string; content: string } | undefined;
+    if (!current) return NextResponse.json({ error: "本章还没有正文草稿，无需恢复。" }, { status: 409 });
+    if (current.status === "generating") return NextResponse.json({ error: "本章正在生成，请等待本次任务结束后再恢复。" }, { status: 409 });
+    const backup = latestDraftBackup(id, row.version, chapterId);
+    if (!backup) return NextResponse.json({ error: "本章没有可恢复的归档正文。" }, { status: 409 });
+    const now = new Date().toISOString();
+    let metaJson: string | null = backup.metaJson;
+    // 归档元信息里的故事状态描述的是当时那一版：清掉后由人工重新接受再固化，避免旧摘要静默回到既定事实。
+    if (metaJson) {
+      try { metaJson = JSON.stringify({ ...normalizeMeta(JSON.parse(metaJson)), storyState: emptyStoryState() }); } catch { metaJson = null; }
+    }
+    db.transaction(() => {
+      archiveDraft(id, row.version, chapterId, "恢复上一版正文前归档当前正文。", now);
+      const update = db.prepare("UPDATE chapter_drafts SET chapter_title = ?, content = ?, meta_json = ?, status = 'draft', input_hash = ?, error_message = NULL, needs_review = 0, review_reason = NULL, auto_continuations = 0, updated_at = ? WHERE project_id = ? AND plan_version = ? AND chapter_id = ? AND status IN ('draft', 'accepted', 'failed-or-unknown')").run(backup.chapterTitle, backup.content, metaJson, sha256(`restored\n${backup.content}`), now, id, row.version, chapterId);
+      if (update.changes !== 1) throw new Error("本章状态已变化，请刷新后重试。");
+      invalidateChapterState(id, row.version, chapterId, "本章正文已恢复为归档版本，需要重新接受后才能作为后续章节的既定事实。");
+      markFollowingChapters(id, row.version, plan.chapters.slice(index + 1).map((item) => item.id), `前一章《${chapter.title}》正文已恢复为旧版本，其后章节需要复核。`);
+    })();
+    return NextResponse.json({ restored: true, chapterId, archivedAt: backup.archivedAt, characters: backup.content.length });
+  }
+
   const retry = body.action === "retry" || body.action === "resume";
+  // REQ-060：regenerate 用新正文覆盖本章草稿（旧文先归档），仍严格一次请求一章，不合并多章（REQ-027）。
+  const regenerate = body.action === "regenerate";
+  if (body.action !== "generate" && !retry && !regenerate) return NextResponse.json({ error: "未知操作。" }, { status: 400 });
   if (retry && body.retryConfirmed !== true) return NextResponse.json({ error: "重试前请核对百炼请求记录和账单，并明确确认未决请求不会重复计费。" }, { status: 400 });
+  if (regenerate && body.regenerateConfirmed !== true) return NextResponse.json({ error: "重新生成会覆盖本章已保存正文（覆盖前归档，可恢复），请明确确认后再发起。" }, { status: 400 });
   // REQ-035：不再读取或校验整书预算，只按「当前方案 + 外发与证据核对 + 模型与计费口径」放行逐章请求。
   const approval = db.prepare("SELECT plan_hash AS planHash, billing_mode AS billingMode, model_id AS modelId, allow_external_transfer AS allowExternalTransfer, evidence_confirmed AS evidenceConfirmed FROM story_plan_approvals WHERE project_id = ? AND plan_version = ?").get(id, row.version) as { planHash: string; billingMode: string; modelId: string; allowExternalTransfer: number; evidenceConfirmed: number } | undefined;
   if (!approval || approval.planHash !== row.plan_hash || approval.allowExternalTransfer !== 1 || approval.evidenceConfirmed !== 1) return NextResponse.json({ error: "请先核对史料，并确认当前完整故事方案与资料外发。" }, { status: 409 });
@@ -481,7 +543,12 @@ export async function POST(request: NextRequest, context: Context) {
     if (priorDraft.needsReview === 1) return NextResponse.json({ error: `前一章《${previous.title}》因前文变更待复核，请复核并接受该章后再生成本章。` }, { status: 409 });
   }
   const existingDraft = db.prepare("SELECT status, content, auto_continuations AS autoContinuations FROM chapter_drafts WHERE project_id = ? AND plan_version = ? AND chapter_id = ?").get(id, row.version, chapterId) as { status: string; content: string; autoContinuations: number } | undefined;
-  if (retry ? !existingDraft || existingDraft.status !== "failed-or-unknown" : Boolean(existingDraft)) {
+  if (regenerate) {
+    if (!existingDraft) return NextResponse.json({ error: "本章还没有已保存正文；直接用「生成本章」即可，无需重新生成。" }, { status: 409 });
+    if (existingDraft.status === "generating") return NextResponse.json({ error: "本章正在生成，请等待本次任务结束。" }, { status: 409 });
+    // 中断章保留着最后一条检查点：先续写或人工补全，整章重写会把已收到的正文一并归档掉。
+    if (existingDraft.status === "failed-or-unknown") return NextResponse.json({ error: "本章是中断状态，请先用「从已保存处继续生成」补完；需要整章重写时请先人工保存一次草稿。" }, { status: 409 });
+  } else if (retry ? !existingDraft || existingDraft.status !== "failed-or-unknown" : Boolean(existingDraft)) {
     return NextResponse.json({ error: retry ? "本章没有可恢复的未知请求。" : "本章已有生成记录。不会自动重发。" }, { status: 409 });
   }
 
@@ -548,7 +615,8 @@ export async function POST(request: NextRequest, context: Context) {
     excludedStoryState: storyState.excluded.map((item) => ({ chapter: `第 ${item.chapterNumber} 章《${item.chapterTitle}》`, reason: item.reason })),
     previousChapter,
   };
-  const prefix = existingDraft?.content ?? "";
+  // 重新生成不带旧正文：请求从零写本章，已保存文本在派发事务里整份归档后才清空。
+  const prefix = regenerate ? "" : existingDraft?.content ?? "";
   const continuationInstruction = `从已保存文本的末尾继续写，若末尾为半句则接完。不重复标题或已有段落，不重写前文，仅输出新增内容，完成本章剩余部分；写完后按系统要求输出 ${metaMarker} 与完整元信息 JSON。`;
   const userPrompt = JSON.stringify(prefix ? { ...payload, continuation: { savedText: prefix, instruction: continuationInstruction } } : payload);
   const inputHash = sha256(systemPrompt + "\n" + userPrompt);
@@ -574,11 +642,19 @@ export async function POST(request: NextRequest, context: Context) {
       if (retry) {
         const update = db.prepare("UPDATE chapter_drafts SET chapter_title = ?, status = 'generating', input_hash = ?, active_attempt_id = ?, estimated_cost_cny = ?, auto_continuations = 0, error_message = NULL, updated_at = ? WHERE project_id = ? AND plan_version = ? AND chapter_id = ? AND status = 'failed-or-unknown' AND content = ?").run(chapter.title, inputHash, attemptId, estimate.ceilingCny ?? 0, now, id, row.version, chapterId, prefix);
         if (update.changes !== 1) throw new Error("本章状态已变化，请刷新后重试。");
+      } else if (regenerate) {
+        // 归档与清空同处一个事务：中途失败一起回滚，不会出现「旧正文已清、归档没有」的丢字窗口。
+        archiveDraft(id, row.version, chapterId, "正文重新生成前归档已保存正文。", now);
+        const update = db.prepare("UPDATE chapter_drafts SET chapter_title = ?, content = '', meta_json = NULL, raw_output = NULL, request_id = NULL, status = 'generating', input_hash = ?, active_attempt_id = ?, estimated_cost_cny = ?, actual_cost_cny = NULL, prompt_tokens = NULL, completion_tokens = NULL, error_message = NULL, needs_review = 0, review_reason = NULL, auto_continuations = 0, updated_at = ? WHERE project_id = ? AND plan_version = ? AND chapter_id = ? AND status IN ('draft', 'accepted')").run(chapter.title, inputHash, attemptId, estimate.ceilingCny ?? 0, now, id, row.version, chapterId);
+        if (update.changes !== 1) throw new Error("本章状态已变化，请刷新后重试。");
+        // 覆盖写与人工改写同口径：本章状态作废，依赖它的后续章节转待复核（REQ-026）。
+        invalidateChapterState(id, row.version, chapterId, "本章正文已重新生成，需要重新接受后才能作为后续章节的既定事实。");
+        markFollowingChapters(id, row.version, plan.chapters.slice(index + 1).map((item) => item.id), `前一章《${chapter.title}》正文已重新生成，其后章节需要复核。`);
       } else {
         db.prepare("INSERT INTO chapter_drafts(project_id, plan_version, plan_hash, chapter_id, chapter_title, content, status, input_hash, estimated_cost_cny, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '', 'generating', ?, ?, ?, ?)").run(id, row.version, row.plan_hash, chapterId, chapter.title, inputHash, estimate.ceilingCny ?? 0, now, now);
         db.prepare("UPDATE chapter_drafts SET active_attempt_id=? WHERE project_id=? AND plan_version=? AND chapter_id=?").run(attemptId, id, row.version, chapterId);
       }
-      db.prepare("INSERT INTO chapter_generation_attempts(id, project_id, plan_version, chapter_id, attempt_number, request_hash, status, estimated_cost_cny, billing_mode, reserved_tokens, initiator, started_at) VALUES (?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?)").run(attemptId, id, row.version, chapterId, attemptNumber, inputHash, estimate.ceilingCny ?? 0, configuration.billingMode, estimate.tokenAllowance, retry ? "manual-resume" : "manual", now);
+      db.prepare("INSERT INTO chapter_generation_attempts(id, project_id, plan_version, chapter_id, attempt_number, request_hash, status, estimated_cost_cny, billing_mode, reserved_tokens, initiator, started_at) VALUES (?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?)").run(attemptId, id, row.version, chapterId, attemptNumber, inputHash, estimate.ceilingCny ?? 0, configuration.billingMode, estimate.tokenAllowance, retry ? "manual-resume" : regenerate ? "manual-regenerate" : "manual", now);
       db.prepare("UPDATE chapter_generation_attempts SET content=? WHERE id=?").run(prefix, attemptId);
     })
     dispatch.immediate();
@@ -742,5 +818,5 @@ export async function POST(request: NextRequest, context: Context) {
       }
     }
   });
-  return NextResponse.json({ chapterId, status: "generating", attemptNumber, autoContinuationLimit: maxAutoContinuations }, { status: 202 });
+  return NextResponse.json({ chapterId, status: "generating", attemptNumber, regenerated: regenerate, autoContinuationLimit: maxAutoContinuations }, { status: 202 });
 }

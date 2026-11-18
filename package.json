@@ -9,6 +9,7 @@
     "corpus:fetch": "node scripts/fetch-history.mjs",
     "corpus:index": "node scripts/index-corpus.mjs",
     "corpus:persons": "node scripts/index-corpus-persons.mjs",
+    "corpus:years": "node scripts/index-corpus-years.mjs",
     "corpus:check": "node scripts/check-corpus.mjs",
     "lint": "eslint .",
     "ebooks:convert": "data/local/tools/mobi-venv/bin/python scripts/convert-mobi.py",
@@ -17,7 +18,9 @@
     "test:mobi": "data/local/tools/mobi-venv/bin/python scripts/test-mobi.py",
     "refs:register": "node scripts/register-reference-novels.mjs",
     "test:auto": "node scripts/test-corpus-auto.mjs",
-    "test:chain": "node scripts/test-creation-chain.mjs"
+    "test:chain": "node scripts/test-creation-chain.mjs",
+    "test:regen": "node scripts/test-regenerate.mjs",
+    "test:outline-groups": "node scripts/test-outline-groups.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",

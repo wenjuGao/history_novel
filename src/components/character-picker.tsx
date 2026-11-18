@@ -54,6 +54,22 @@ type Data = {
 
 type EvidenceDraft = { documentId: string; evidence: string; start: string; end: string; confirmed: boolean };
 
+type PersonDeed = { year: number; text: string; period: string; volume: string; book: string; url: string };
+type PersonProfile = {
+	name: string;
+	birth: number | null;
+	birthPrecision: "exact" | "approx" | "unknown";
+	death: number | null;
+	deathPrecision: "exact" | "approx" | "unknown";
+	activeFrom: number | null;
+	activeTo: number | null;
+	entryCount: number;
+	deeds: PersonDeed[];
+	yearSource: string;
+	needsReview: boolean;
+	plausible: boolean;
+};
+
 type CorpusPerson = {
 	name: string;
 	mentions: number;
@@ -64,10 +80,12 @@ type CorpusPerson = {
 	evidenceBookName: string;
 	evidenceVolume: string;
 	evidenceUrl: string;
+	yearState: "in-range" | "unknown" | "out-of-range";
+	profile: PersonProfile | null;
 	imported: boolean;
 };
 
-type PersonsData = { defaults: string[]; blocked: string[]; candidates: CorpusPerson[] };
+type PersonsData = { defaults: string[]; blocked: string[]; candidates: CorpusPerson[]; pending: CorpusPerson[]; ready: boolean };
 type AutoRun = { status: string; steps: Array<{ key: string; ok: boolean; detail: string }> };
 
 const emptyEvidence: EvidenceDraft = { documentId: "", evidence: "", start: "", end: "", confirmed: false };
@@ -238,6 +256,110 @@ export function CharacterPicker({
 	const nameOf = (id: string) => data?.people.find((item) => item.id === id)?.name ?? id;
 	const year = (value: number | null) => (value === null ? "未知" : String(astronomicalToHistorical(value)));
 	const sourceTitle = (id: string) => data?.sources.find((item) => item.id === id)?.title ?? "未知";
+	const lifespan = (value: number | null, precision: string) =>
+		value === null ? "未详" : `${precision === "approx" ? "约" : ""}${astronomicalToHistorical(value)}`;
+	const activeSpan = (profile: PersonProfile | null) =>
+		profile && profile.activeFrom !== null && profile.activeTo !== null
+			? `${astronomicalToHistorical(profile.activeFrom)}—${astronomicalToHistorical(profile.activeTo)}`
+			: "未详";
+	const yearSourceLabel = (profile: PersonProfile | null) =>
+		profile ? (profile.yearSource === "model" ? "模型补全" : profile.yearSource === "mixed" ? "锚点＋模型" : "年纪锚点") : "无档案";
+
+	function corpusPersonRow(item: CorpusPerson) {
+		return (
+			<li className="rounded-md border border-border bg-surface p-2.5" key={item.name}>
+				<label className="flex items-start gap-2">
+					<Checkbox
+						className="mt-0.5"
+						disabled={busy || autoBusy || item.imported}
+						checked={item.imported || picked.includes(item.name)}
+						onCheckedChange={(value) =>
+							setPicked((current) =>
+								value === true ? [...new Set([...current, item.name])] : current.filter((name) => name !== item.name),
+							)
+						}
+					/>
+					<span className="min-w-0 flex-1 text-[12px] leading-snug">
+						<strong className="font-medium">{item.name}</strong>
+						<span className="text-muted-foreground">
+							{" "}
+							· 生卒 {lifespan(item.profile?.birth ?? null, item.profile?.birthPrecision ?? "unknown")}—
+							{lifespan(item.profile?.death ?? null, item.profile?.deathPrecision ?? "unknown")}
+							{" "}· 活动 {activeSpan(item.profile)}
+							{" "}· 提及 {item.mentions} 次 / {item.volumeHits} 卷
+							{item.bookCount > 1 ? ` / ${item.bookCount} 部` : ""}
+						</span>
+						{item.strong && (
+							<Badge variant="success" className="ml-1.5 align-middle">
+								强关联
+							</Badge>
+						)}
+						{item.yearState === "unknown" && (
+							<Badge variant="warning" className="ml-1.5 align-middle">
+								年份待核
+							</Badge>
+						)}
+						{item.imported && (
+							<Badge variant="outline" className="ml-1.5 align-middle">
+								已导入
+							</Badge>
+						)}
+					</span>
+				</label>
+
+				{item.profile && item.profile.deeds.length > 0 && (
+					<ul className="flex flex-col gap-1 pl-6 pt-1">
+						{item.profile.deeds.slice(0, 3).map((deed) => (
+							<li className="text-[11px] leading-relaxed text-muted-foreground" key={`${deed.year}-${deed.text}`}>
+								<span className="text-foreground">{astronomicalToHistorical(deed.year)}年</span>
+								{deed.period ? ` ${deed.period}` : ""}：{deed.text}
+								{deed.volume ? (
+									deed.url ? (
+										<a
+											className="ml-1 underline decoration-dotted underline-offset-2"
+											href={deed.url}
+											target="_blank"
+											rel="noreferrer"
+										>
+											{deed.volume}
+										</a>
+									) : (
+										` —— ${deed.volume}`
+									)
+								) : null}
+							</li>
+						))}
+					</ul>
+				)}
+
+				<p className="pl-6 pt-1 text-[11px] leading-relaxed text-muted-foreground">
+					{item.evidence || "没有可比对的原文片段"}
+					{item.evidenceBookName ? ` —— ${item.evidenceBookName}${item.evidenceVolume ? `·${item.evidenceVolume}` : ""}` : ""}
+				</p>
+				<div className="flex items-center gap-3 pl-6 pt-1">
+					<span className="text-[11px] text-muted-foreground">年份来源：{yearSourceLabel(item.profile)}</span>
+					{item.evidenceUrl && (
+						<a
+							className="text-[11px] text-muted-foreground underline decoration-dotted underline-offset-2"
+							href={item.evidenceUrl}
+							target="_blank"
+							rel="noreferrer"
+						>
+							查原文
+						</a>
+					)}
+					<button
+						type="button"
+						className="text-[11px] text-muted-foreground underline decoration-dotted underline-offset-2"
+						disabled={busy || autoBusy}
+						onClick={() => void postPersons({ action: "block", names: [item.name] })}
+					>
+						不再显示
+					</button>
+				</div>
+			</li>
+		);
+	}
 
 	function evidenceBlock(
 		idPrefix: string,
@@ -325,12 +447,21 @@ export function CharacterPicker({
 
 	const matched = data.people.filter((item) => item.match || item.selected);
 	const unmatched = data.people.filter((item) => !item.match);
+	// 批量全选只提交仍匹配当前范围且未勾选的行；「不再匹配」的行留给人工取消或调整范围。
+	const selectAllIds = matched.filter((item) => item.match && !item.selected).map((item) => item.id);
+	const deselectAllIds = matched.filter((item) => item.selected).map((item) => item.id);
+	// 候选「全选」只是批量写入勾选，仍要人工导入并核对原文，已导入者不再进入勾选。
+	const candidateSelectable = persons ? [...new Set(persons.candidates.filter((item) => !item.imported).map((item) => item.name))] : [];
+	const pendingSelectable = persons ? [...new Set(persons.pending.filter((item) => !item.imported).map((item) => item.name))] : [];
+	const candidateAdds = candidateSelectable.filter((name) => !picked.includes(name));
+	const pendingAdds = pendingSelectable.filter((name) => !picked.includes(name));
+	const pickNames = (names: string[]) => setPicked((current) => [...new Set([...current, ...names])]);
 	const evidenceReady = (draft: EvidenceDraft) => Boolean(draft.documentId && draft.evidence.trim() && draft.start && draft.end && draft.confirmed);
 
 	return (
 		<div className="flex flex-col gap-4">
 			<p className="text-[12px] leading-relaxed text-muted-foreground">
-				候选人物来自你核定的活动证据。区域按名称匹配，多个区域用顿号分隔；公元前年份填负数，没有公元 0 年。
+				候选人物来自你核定的活动证据。区域为可选项，留空表示不限区域；填多个区域用顿号分隔。公元前年份填负数，没有公元 0 年。
 			</p>
 
 			{message && <p role="status" className="text-[11px] text-success">{message}</p>}
@@ -342,91 +473,75 @@ export function CharacterPicker({
 
 			<p className="text-[11px] leading-relaxed text-muted-foreground">
 				{data.scope
-					? `当前范围：${year(data.scope.start)} 至 ${year(data.scope.end)} 年 · ${data.scope.region}`
+					? `当前范围：${year(data.scope.start)} 至 ${year(data.scope.end)} 年 · ${data.scope.region.trim() || "不限区域"}`
 					: "请先在第 01 步保存历史范围。"}
 			</p>
 
 			<section className="flex flex-col gap-2 rounded-md border border-border bg-surface-sunken/60 p-3">
 				<div className="flex items-center justify-between gap-2">
 					<h4 className="text-[13px] font-medium">史料人物候选</h4>
-					<Badge variant={persons ? "outline" : "warning"}>
-						{persons ? `强关联 ${persons.candidates.filter((item) => item.strong).length} / ${persons.candidates.length}` : "索引未就绪"}
+					<Badge variant={persons?.ready ? "outline" : "warning"}>
+						{persons
+							? persons.ready
+								? `区间内 ${persons.candidates.length} · 待核 ${persons.pending.length}`
+								: "年份未预处理"
+							: "索引未就绪"}
 					</Badge>
 				</div>
 				<p className="text-[11px] leading-relaxed text-muted-foreground">
-					由本机古籍索引按名称与动词邻接得到，零 Token；默认勾选存在强关联的人物。勾选与导入都只是候选，原文证据仍需人工核对。
+					候选来自本机古籍索引的名称与动词邻接抽取，年份来自 npm run corpus:years 预处理的年纪锚点，全程零 Token；只保留生卒或活动区间与当前范围有交集的人物，默认勾选存在强关联者。勾选与导入都只是候选，原文证据仍需人工核对。
 				</p>
 
 				{!persons ? (
 					<Skeleton className="h-16" />
+				) : !persons.ready ? (
+					<Alert>
+						<AlertDescription>
+							人物年份档案尚未预处理，当前无法按生卒区间筛选候选。请在终端执行 npm run corpus:years（零 Token）后刷新本页。
+						</AlertDescription>
+					</Alert>
 				) : persons.candidates.length === 0 ? (
 					<p className="text-[12px] leading-relaxed text-muted-foreground">
-						当前时间阶段没有史料人物候选，请在终端执行 npm run corpus:persons 后刷新。
+						当前时间阶段内没有可考的史料人物。可调整范围、展开下方「年份待核」，或在终端执行 npm run corpus:persons 与 npm run corpus:years 后刷新。
 					</p>
 				) : (
-					<ul className="flex max-h-[320px] flex-col gap-1.5 overflow-y-auto pr-1">
-						{persons.candidates.map((item) => (
-							<li className="rounded-md border border-border bg-surface p-2.5" key={item.name}>
-								<label className="flex items-start gap-2">
-									<Checkbox
-										className="mt-0.5"
-										disabled={busy || autoBusy || item.imported}
-										checked={item.imported || picked.includes(item.name)}
-										onCheckedChange={(value) =>
-											setPicked((current) =>
-												value === true ? [...new Set([...current, item.name])] : current.filter((name) => name !== item.name),
-											)
-										}
-									/>
-									<span className="min-w-0 flex-1 text-[12px] leading-snug">
-										<strong className="font-medium">{item.name}</strong>
-										<span className="text-muted-foreground">
-											{" "}
-											· 提及 {item.mentions} 次 / {item.volumeHits} 卷
-											{item.bookCount > 1 ? ` / ${item.bookCount} 部` : ""}
-										</span>
-										{item.strong && (
-											<Badge variant="success" className="ml-1.5 align-middle">
-												强关联
-											</Badge>
-										)}
-										{item.imported && (
-											<Badge variant="outline" className="ml-1.5 align-middle">
-												已导入
-											</Badge>
-										)}
-									</span>
-								</label>
-								<p className="pl-6 pt-1 text-[11px] leading-relaxed text-muted-foreground">
-									{item.evidence || "没有可比对的原文片段"}
-									{item.evidenceBookName ? ` —— ${item.evidenceBookName}${item.evidenceVolume ? `·${item.evidenceVolume}` : ""}` : ""}
-								</p>
-								<div className="flex items-center gap-3 pl-6 pt-1">
-									{item.evidenceUrl && (
-										<a
-											className="text-[11px] text-muted-foreground underline decoration-dotted underline-offset-2"
-											href={item.evidenceUrl}
-											target="_blank"
-											rel="noreferrer"
-										>
-											查原文
-										</a>
-									)}
-									<button
-										type="button"
-										className="text-[11px] text-muted-foreground underline decoration-dotted underline-offset-2"
-										disabled={busy || autoBusy}
-										onClick={() => void postPersons({ action: "block", names: [item.name] })}
-									>
-										不再显示
-									</button>
-								</div>
-							</li>
-						))}
-					</ul>
+					<ul className="flex max-h-[320px] flex-col gap-1.5 overflow-y-auto pr-1">{persons.candidates.map(corpusPersonRow)}</ul>
+				)}
+
+				{persons?.ready && persons.pending.length > 0 && (
+					<details className="rounded-md border border-border bg-surface px-3 py-2">
+						<summary className="cursor-pointer text-[12px] text-muted-foreground">
+							年份待核（{persons.pending.length}）：缺少可信生卒或活动区间，需人工比对史料
+						</summary>
+						<div className="mt-2 flex flex-wrap items-center gap-1.5">
+							<Button
+								type="button"
+								variant="ghost"
+								size="xs"
+								disabled={busy || autoBusy || pendingAdds.length === 0}
+								onClick={() => pickNames(pendingAdds)}
+							>
+								全选待核 {pendingSelectable.length} 位
+							</Button>
+						</div>
+						<ul className="mt-2 flex max-h-[320px] flex-col gap-1.5 overflow-y-auto pr-1">{persons.pending.map(corpusPersonRow)}</ul>
+					</details>
 				)}
 
 				<div className="flex flex-wrap items-center gap-2">
+					<Button
+						type="button"
+						variant="ghost"
+						size="xs"
+						disabled={busy || autoBusy || candidateAdds.length === 0}
+						onClick={() => pickNames(candidateAdds)}
+					>
+						全选区间内 {candidateSelectable.length} 位
+					</Button>
+					<Button type="button" variant="ghost" size="xs" disabled={picked.length === 0} onClick={() => setPicked([])}>
+						清空选择
+					</Button>
+					<span className="text-[11px] text-muted-foreground">已勾 {picked.length} 位</span>
 					<Button
 						type="button"
 						size="sm"
@@ -480,9 +595,28 @@ export function CharacterPicker({
 			<Separator />
 
 			<section className="flex flex-col gap-2">
-				<div className="flex items-center justify-between gap-2">
+				<div className="flex flex-wrap items-center justify-between gap-2">
 					<h4 className="text-[13px] font-medium">匹配当前范围的人物</h4>
-					<Badge variant={selectedCount ? "success" : "outline"}>已选 {selectedCount}</Badge>
+					<div className="flex flex-wrap items-center gap-1.5">
+						<Badge variant={selectedCount ? "success" : "outline"}>已选 {selectedCount}</Badge>
+						{/* 一次批量请求提交全部候选，服务端逐条校验，不再匹配的行不进入 ids。 */}
+						<Button
+							variant="ghost"
+							size="xs"
+							disabled={busy || selectAllIds.length === 0}
+							onClick={() => void save({ action: "selectMany", ids: selectAllIds, selected: true })}
+						>
+							全选
+						</Button>
+						<Button
+							variant="ghost"
+							size="xs"
+							disabled={busy || deselectAllIds.length === 0}
+							onClick={() => void save({ action: "selectMany", ids: deselectAllIds, selected: false })}
+						>
+							清空
+						</Button>
+					</div>
 				</div>
 				{matched.length === 0 && (
 					<p className="text-[12px] leading-relaxed text-muted-foreground">
@@ -503,7 +637,8 @@ export function CharacterPicker({
 									<strong className="font-medium">{item.name}</strong>
 									<span className="text-muted-foreground">
 										{" "}
-										· {item.region ?? "区域未知"} · {year(item.start)}—{year(item.end)}
+										· {item.region?.trim() || "未填区域"} ·
+										{item.start === null || item.end === null ? "活动年份待核" : `${year(item.start)}—${year(item.end)}`}
 									</span>
 									{!item.match && <span className="ml-1 text-[11px] text-warning">（不再匹配，请取消或调整范围）</span>}
 								</span>
@@ -523,8 +658,8 @@ export function CharacterPicker({
 						<ul className="mt-2 flex flex-col gap-1">
 							{unmatched.map((item) => (
 								<li className="text-[11px] leading-relaxed text-muted-foreground" key={item.id}>
-									<strong className="text-foreground">{item.name}</strong>：{item.region ?? "缺少活动区域"}，
-									{year(item.start)}—{year(item.end)}；{item.evidence}
+									<strong className="text-foreground">{item.name}</strong>：{item.region?.trim() || "未填区域"}，
+									{item.start === null || item.end === null ? "活动年份待核" : `${year(item.start)}—${year(item.end)}`}；{item.evidence}
 								</li>
 							))}
 						</ul>
@@ -702,7 +837,7 @@ export function CharacterPicker({
 							size="sm"
 							className="self-start"
 							disabled={
-								busy || !person.name.trim() || !person.region.trim() || !evidenceReady(person)
+								busy || !person.name.trim() || !evidenceReady(person)
 							}
 							onClick={() =>
 								void save({

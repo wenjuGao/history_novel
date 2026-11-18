@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Check, LoaderCircle, Plus, RotateCcw, ShieldCheck, Trash2, Undo2 } from "lucide-react";
+import { Check, LoaderCircle, Plus, RotateCcw, Search, ShieldCheck, Trash2, Undo2 } from "lucide-react";
 import { toast } from "sonner";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -14,6 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
+import { astronomicalToHistorical } from "@/lib/history-time";
 
 type Participant = { id: string; name: string; participation: string };
 type PlotEvent = {
@@ -41,8 +42,23 @@ type Data = {
 	sources: Array<{ id: string; title: string }>;
 };
 
-const statusText: Record<PlotEvent["status"], string> = { candidate: "待核对", adopted: "已采用", rejected: "已排除" };
-const statusVariant: Record<PlotEvent["status"], "success" | "warning" | "outline"> = {
+/** 史料候选事件：带年纪事按「时间 ∩ 已勾选人物」检索得到，年份为天文纪年，展示时转历史纪年。 */
+type CorpusEvent = {
+	key: string;
+	year: number;
+	period: string;
+	text: string;
+	title: string;
+	volume: string;
+	bookName: string;
+	documentId: string | null;
+	url: string;
+	names: string[];
+	participantIds: string[];
+};
+type CorpusResult = { ready: boolean; candidates: CorpusEvent[]; note: string };
+
+const statusText: Record<PlotEvent["status"], string> = { candidate: "待核对", adopted: "已采用", rejected: "已排除" };const statusVariant: Record<PlotEvent["status"], "success" | "warning" | "outline"> = {
 	candidate: "warning",
 	adopted: "success",
 	rejected: "outline",
@@ -110,12 +126,42 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 	const [checked, setChecked] = useState<Set<string>>(new Set());
 	const [verifyTarget, setVerifyTarget] = useState<PlotEvent | null>(null);
 	const [verifyConfirmed, setVerifyConfirmed] = useState(false);
+	const [corpus, setCorpus] = useState<CorpusResult | null>(null);
+	const [corpusBusy, setCorpusBusy] = useState(false);
+
+	async function loadCorpus(start: string, end: string) {
+		setCorpusBusy(true);
+		try {
+			const params = new URLSearchParams({ start, end, limit: "40" });
+			const response = await fetch(`/api/projects/${projectId}/events/candidates?${params.toString()}`, { cache: "no-store" });
+			const result = (await response.json()) as CorpusResult & { error?: string };
+			if (!response.ok) throw new Error(result.error ?? "无法读取史料候选。");
+			setCorpus(result);
+		} catch (cause) {
+			setCorpus(null);
+			toast.error(cause instanceof Error ? cause.message : "无法读取史料候选。");
+		} finally {
+			setCorpusBusy(false);
+		}
+	}
 
 	function toggleChecked(key: string) {
 		setChecked((current) => {
 			const next = new Set(current);
 			if (next.has(key)) next.delete(key);
 			else next.add(key);
+			return next;
+		});
+	}
+
+	// 勾选＝人工断言已核对原文，批量写入只覆盖传入的 key，不会动另一列的核对状态。
+	function markChecked(keys: string[], value: boolean) {
+		setChecked((current) => {
+			const next = new Set(current);
+			for (const key of keys) {
+				if (value) next.add(key);
+				else next.delete(key);
+			}
 			return next;
 		});
 	}
@@ -185,8 +231,29 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 		setSaving(false);
 		if (ok) {
 			setDraft(null);
+			setCorpus(null);
 			toast.success(draft.id ? "事件已更新并采用。" : "事件已新增并采用。");
 		}
+	}
+
+	// 填入只替换证据、出处与年份，事件名称保留作者已经写好的措辞。
+	function fillFromCorpus(item: CorpusEvent) {
+		setDraft((current) =>
+			current
+				? {
+						...current,
+						title: current.title.trim() || item.title,
+						start: String(astronomicalToHistorical(item.year)),
+						end: String(astronomicalToHistorical(item.year)),
+						evidence: item.text,
+						documentId: item.documentId ?? current.documentId,
+						participants: [...new Set([...current.participants, ...item.participantIds])],
+						sourceKey: item.key,
+						confirmed: false,
+					}
+				: current,
+		);
+		toast.success("已填入该条史料记事，请核对原文后保存。");
 	}
 
 	if (failed) {
@@ -207,6 +274,20 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 	}
 
 	const adopted = data.events.filter((event) => event.status === "adopted" && event.kind === "historical").length;
+	// 批量标记只作用于范围内、可逐条核对的条目；范围外条目仍需人工改年份或调整第 01 步范围。
+	const candidateKeys = data.candidates.filter((candidate) => inScope(candidate, data.scope)).map((candidate) => candidate.sourceKey ?? candidate.title);
+	const candidateUnchecked = candidateKeys.filter((key) => !checked.has(key));
+	const candidateChecked = candidateKeys.filter((key) => checked.has(key));
+	const storedKeys = data.events.filter((event) => event.status === "candidate" && inScope(event, data.scope)).map((event) => event.id ?? "");
+	const storedUnchecked = storedKeys.filter((key) => !checked.has(key));
+	const storedChecked = storedKeys.filter((key) => checked.has(key));
+	// 服务端限制单条事件最多 12 位参与人物，全选只补到上限，避免保存时才报错。
+	const participantAdds = draft
+		? data.people
+				.map((person) => person.id)
+				.filter((id) => !draft.participants.includes(id))
+				.slice(0, Math.max(12 - draft.participants.length, 0))
+		: [];
 
 	return (
 		<div className="flex flex-col gap-3">
@@ -217,14 +298,30 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 
 			<div className="flex items-center justify-between gap-2">
 				<p className="text-[11px] tracking-[0.16em] text-muted-foreground uppercase">已采用 {adopted} 条历史事件</p>
-				<Button size="sm" variant="outline" onClick={() => setDraft({ ...blank, region: data.scope?.region ?? "" })}>
+				<Button
+					size="sm"
+					variant="outline"
+					onClick={() => {
+						setCorpus(null);
+						setDraft({ ...blank, region: data.scope?.region ?? "" });
+					}}
+				>
 					<Plus size={14} /> 新增事件
 				</Button>
 			</div>
 
 			{data.candidates.length > 0 && (
 				<section className="flex flex-col gap-1.5">
-					<h4 className="text-[11px] tracking-[0.16em] text-muted-foreground uppercase">候选 {data.candidates.length}</h4>
+					<div className="flex flex-wrap items-center gap-1.5">
+						<h4 className="text-[11px] tracking-[0.16em] text-muted-foreground uppercase">候选 {data.candidates.length}</h4>
+						{/* 按钮只写「全部标记已核对」：批量勾选是人工核对断言，采用仍需逐条确认原文。 */}
+						<Button variant="ghost" size="xs" disabled={candidateUnchecked.length === 0} onClick={() => markChecked(candidateKeys, true)}>
+							全部标记已核对
+						</Button>
+						<Button variant="ghost" size="xs" disabled={candidateChecked.length === 0} onClick={() => markChecked(candidateKeys, false)}>
+							清空
+						</Button>
+					</div>
 					<ul className="flex flex-col gap-1.5">
 						{data.candidates.map((candidate) => {
 							const withinRange = inScope(candidate, data.scope);
@@ -277,6 +374,18 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 			)}
 
 			<section className="flex flex-col gap-1.5">
+				{storedKeys.length > 0 && (
+					<div className="flex flex-wrap items-center gap-1.5">
+						<span className="text-[11px] text-muted-foreground">待核对 {storedKeys.length} 条</span>
+						{/* 与候选列表同一口径：批量标记只写核对状态，采用仍逐条确认。 */}
+						<Button variant="ghost" size="xs" disabled={storedUnchecked.length === 0} onClick={() => markChecked(storedKeys, true)}>
+							全部标记已核对
+						</Button>
+						<Button variant="ghost" size="xs" disabled={storedChecked.length === 0} onClick={() => markChecked(storedKeys, false)}>
+							清空
+						</Button>
+					</div>
+				)}
 				{data.events.length === 0 ? (
 					<p className="rounded-sm border border-dashed border-input px-3 py-6 text-center text-[12px] text-muted-foreground">
 						还没有事件。先在第 03 步核定人物活动，或直接新增。
@@ -389,7 +498,14 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 			</section>
 
 			{draft && (
-				<Dialog open onOpenChange={(open) => !open && setDraft(null)}>
+				<Dialog
+					open
+					onOpenChange={(open) => {
+						if (open) return;
+						setDraft(null);
+						setCorpus(null);
+					}}
+				>
 					<DialogContent>
 						<DialogHeader>
 							<DialogTitle>{draft.id ? "编辑事件" : "新增事件"}</DialogTitle>
@@ -445,6 +561,63 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 								<Label htmlFor="event-region">区域</Label>
 								<Input id="event-region" maxLength={200} value={draft.region} onChange={(event) => setDraft({ ...draft, region: event.target.value })} />
 							</label>
+							{draft.kind === "historical" && !draft.id && (
+								<div className="flex flex-col gap-2 rounded-sm border border-border bg-surface-sunken/60 p-2.5">
+									<div className="flex items-center justify-between gap-2">
+										<p className="text-[11px] tracking-[0.16em] text-muted-foreground uppercase">史料候选事件</p>
+										<Button
+											size="xs"
+											variant="outline"
+											disabled={corpusBusy || !draft.start || !draft.end}
+											onClick={() => void loadCorpus(draft.start, draft.end)}
+										>
+											{corpusBusy ? <LoaderCircle size={12} className="animate-spin" /> : <Search size={12} />} 按年份查询
+										</Button>
+									</div>
+									<p className="text-[11px] leading-relaxed text-muted-foreground">
+										在已定年的史料记事里检索该区间与已勾选人物（{data.people.filter((person) => person.selected === 1).length} 位）相关的真实事件；候选只是线索，填入后仍需核对原文。
+									</p>
+									{corpus && !corpus.ready && (
+										<Alert>
+											<AlertDescription>带年纪事尚未预处理，请在终端执行 npm run corpus:years 后重新查询。</AlertDescription>
+										</Alert>
+									)}
+									{corpus?.note && <p className="text-[11px] leading-relaxed text-warning">{corpus.note}</p>}
+									{corpus && corpus.ready && corpus.candidates.length === 0 && (
+										<p className="text-[11px] leading-relaxed text-muted-foreground">该区间没有与已勾选人物相关的记事，可改为手工新增。</p>
+									)}
+									{corpus && corpus.candidates.length > 0 && (
+										<ul className="flex max-h-[240px] flex-col gap-1.5 overflow-y-auto pr-1">
+											{corpus.candidates.map((item) => (
+												<li className="flex flex-col gap-1 rounded-sm border border-border bg-surface px-2.5 py-2" key={item.key}>
+													<p className="text-[11px] text-muted-foreground">
+														<span className="text-foreground">{astronomicalToHistorical(item.year)} 年</span>
+														{item.period ? ` · ${item.period}` : ""} · {item.bookName}·{item.volume}
+														{item.names.length > 0 ? ` · ${item.names.join("、")}` : ""}
+													</p>
+													<p className="text-[11.5px] leading-relaxed">{item.text}</p>
+													<div className="flex flex-wrap items-center gap-2">
+														<Button size="xs" disabled={!item.documentId} onClick={() => fillFromCorpus(item)}>
+															填入
+														</Button>
+														{!item.documentId && <span className="text-[11px] text-muted-foreground">该书尚未固定为本项目资料</span>}
+														{item.url && (
+															<a
+																className="text-[11px] text-muted-foreground underline decoration-dotted underline-offset-2"
+																href={item.url}
+																target="_blank"
+																rel="noreferrer"
+															>
+																查原文
+															</a>
+														)}
+													</div>
+												</li>
+											))}
+										</ul>
+									)}
+								</div>
+							)}
 							<label className="flex flex-col gap-1.5">
 								<Label htmlFor="event-summary">本章要写什么</Label>
 								<Textarea
@@ -492,6 +665,24 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 							{data.people.length > 0 && (
 								<fieldset className="flex flex-col gap-1.5">
 									<legend className="text-[12px] text-foreground">参与人物</legend>
+									<div className="flex flex-wrap items-center gap-1.5">
+										<Button
+											variant="ghost"
+											size="xs"
+											disabled={saving || participantAdds.length === 0}
+											onClick={() => setDraft({ ...draft, participants: [...draft.participants, ...participantAdds] })}
+										>
+											全选
+										</Button>
+										<Button
+											variant="ghost"
+											size="xs"
+											disabled={saving || draft.participants.length === 0}
+											onClick={() => setDraft({ ...draft, participants: [] })}
+										>
+											清空
+										</Button>
+									</div>
 									<div className="flex flex-wrap gap-x-3 gap-y-1.5">
 										{data.people.map((person) => (
 											<label key={person.id} className="flex items-center gap-1.5 text-[12px] text-muted-foreground">

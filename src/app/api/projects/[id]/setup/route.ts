@@ -13,7 +13,8 @@ function people(id:string) {
  return db.prepare(`SELECT c.*, d.title AS source, a.start_year AS start, a.end_year AS end, a.region FROM characters c JOIN documents d ON d.id=c.document_id LEFT JOIN character_activity a ON a.character_id=c.id WHERE c.project_id=? ORDER BY c.created_at`).all(id) as Person[];
 }
 function scope(id:string) {return db.prepare('SELECT start_year AS start, end_year AS end, region FROM project_scope WHERE project_id=?').get(id) as Scope|undefined;}
-function matches(p:Person, s:Scope) {return overlaps(p.start,p.end,s.start,s.end) && s.region.split(/[、,，]/).map(v=>v.trim()).includes(p.region??'');}
+// 范围为空区域＝不限区域（REQ-003）；人物活动无区域记录时也不因缺区域而判为不匹配。
+function matches(p:Person, s:Scope) {return overlaps(p.start,p.end,s.start,s.end) && (!s.region.trim() || s.region.split(/[、,，]/).map(v=>v.trim()).includes(p.region??''));}
 export async function GET(request:NextRequest, context:Context) {
  if (!isLoopbackRequest(request)) return NextResponse.json({error:'仅允许本机访问。'},{status:403});
  const {id}=await context.params;
@@ -34,6 +35,8 @@ export async function POST(request:NextRequest, context:Context) {
   const b=await request.json();
   if (!b || typeof b!=='object') throw new Error('请求无效。');
   const text=(key:string,max=1000)=> {if(typeof b[key]!=='string'||!b[key].trim()||b[key].length>max) throw new Error('请完整填写有效内容。');return b[key].trim() as string;};
+  // 批量勾选要回传实际生效条数与跳过的 id，故单独收集结果，其余操作仍只返回 {ok:true}。
+  let batch:{selected:number;skipped:string[]}|null=null;
   const operation=()=>{
    if(b.action==='select') {
     if(typeof b.selected!=='boolean') throw new Error('选择无效。');
@@ -41,6 +44,17 @@ export async function POST(request:NextRequest, context:Context) {
     if(!p) throw new Error('人物不存在。');
     if(b.selected && (!s || !matches(p,s))) throw new Error('人物活动证据不匹配当前范围，请先补充资料或调整范围。');
     db.prepare('UPDATE characters SET selected=? WHERE id=? AND project_id=?').run(b.selected?1:0,b.id,id);
+   } else if(b.action==='selectMany') {
+    // 批量勾选逐条校验范围：不匹配的人物跳过并回传 id，不让整批因一人失败；取消勾选不设范围门槛。
+    if(typeof b.selected!=='boolean') throw new Error('选择无效。');
+    if(!Array.isArray(b.ids)) throw new Error('请选择人物。');
+    const all=people(id),s=scope(id);
+    // 去重后再按 2000 上限截断，实际生效范围只限本作品已有人物。
+    const ids=[...new Set((b.ids as unknown[]).map(key=>typeof key==='string'?key.trim():'').filter(Boolean))].slice(0,2000);
+    const pass=ids.filter(key=>{const p=all.find(x=>x.id===key);if(!p) return false;return !b.selected||s!==undefined&&matches(p,s);});
+    const result:{selected:number;skipped:string[]}={selected:0,skipped:ids.filter(key=>!pass.includes(key))};
+    db.transaction(()=>{for(const key of pass) result.selected+=db.prepare('UPDATE characters SET selected=? WHERE id=? AND project_id=?').run(b.selected?1:0,key,id).changes;})();
+    batch=result;
    } else if(b.action==='fiction') {
     const kind=text('kind',20),title=text('title',80),content=text('content',10000);
     if(!['人物','关系','对白','心理','日常场景'].includes(kind)) throw new Error('虚构类别无效。');
@@ -56,8 +70,10 @@ export async function POST(request:NextRequest, context:Context) {
     if(b.confirmed!==true) throw new Error('请核对原文确实支持所填活动或关系后确认。');
     if(b.action==='person') {
      const personId=randomUUID();
+     // 活动区域可留空：范围未限区域时，人物只凭时间证据入选。
+     const region=typeof b.region==='string'&&b.region.trim()?b.region.trim().slice(0,200):'';
      db.prepare('INSERT INTO characters (id,project_id,name,document_id,evidence,created_at) VALUES (?,?,?,?,?,?)').run(personId,id,text('name',80),documentId,evidence,new Date().toISOString());
-     db.prepare('INSERT INTO character_activity VALUES (?,?,?,?)').run(personId,start,end,text('region',200));
+     db.prepare('INSERT INTO character_activity VALUES (?,?,?,?)').run(personId,start,end,region);
     } else {
      const from=text('from',100),to=text('to',100),all=people(id);
      if(from===to||![from,to].every(key=>all.some(p=>p.id===key))) throw new Error('请选择本作品中两个不同人物。');
@@ -81,8 +97,10 @@ export async function POST(request:NextRequest, context:Context) {
     if(!db.prepare("DELETE FROM historical_relations WHERE id=? AND project_id=? AND review_status='auto'").run(relationId,id).changes) throw new Error('待核关系线索不存在。');
    } else throw new Error('操作无效。');
    db.prepare('UPDATE projects SET version=version+1,updated_at=? WHERE id=?').run(new Date().toISOString(),id);
+   // 事务函数的返回值会原样传回调用方，闭包内赋值的变量在这里会被类型收窄成 null。
+   return batch;
   };
-  db.transaction(operation)();
-  return NextResponse.json({ok:true});
+  const applied=db.transaction(operation)();
+  return NextResponse.json(applied?{ok:true,...applied}:{ok:true});
  } catch(error) {return NextResponse.json({error:error instanceof Error && !/SQLITE|constraint|database/i.test(error.message)?error.message:'保存失败，请检查输入。'},{status:400});}
 }

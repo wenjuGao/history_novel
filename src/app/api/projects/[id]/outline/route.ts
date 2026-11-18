@@ -5,18 +5,21 @@ import { localOutlinePlan } from '@/lib/auto-setup'
 import { db } from '@/lib/db'
 import { isLoopbackRequest, isSameOriginLoopback } from '@/lib/security'
 import { buildGenerationContext, outlineEvidence, projectScope } from '@/lib/plot-events'
-import { stampProposal } from '@/lib/proposal-binding'
+import { planProposalIssue, proposalGateReason, stampProposal } from '@/lib/proposal-binding'
 import { activeReferenceSpec } from '@/lib/reference-spec'
-import { commitPlan, parsePlan, PlanVersionError, readPlan, sha256, validPlan } from '@/lib/story-plan'
+import { commitPlan, parsePlan, PlanVersionError, readPlan, sha256, validPlan, type Chapter } from '@/lib/story-plan'
+import { MAX_PLAN_CHAPTERS } from '@/lib/plan-limits'
 import {
-	estimateFor,
 	generateOutline,
+	generateOutlineGroup,
+	mergeOutlinePlan,
 	outlineBlockReason,
+	outlineEstimate,
 	outlineModelId,
-	outlinePayload,
 	outlineSystemPrompt,
 	OutlineError,
 	unknownEvidenceIds,
+	type OutlineBookFrame,
 } from '@/lib/outline-generate'
 
 export const runtime = 'nodejs'
@@ -43,6 +46,10 @@ export async function GET(request: NextRequest, context: Context) {
 	return NextResponse.json(
 		{
 			blocked: outlineBlockReason(id),
+			// REQ-060：剧情调整后已保存章纲会失去有效绑定；这里回显过期原因，界面据此给出重新生成入口。
+			proposalIssue: committed ? planProposalIssue(id, committed) : null,
+			// 提案类拦截是「可绕过补齐」的：界面保留重新生成入口与跳转，范围/证据/规格类拦截才整块收起操作区。
+			proposalBlocked: Boolean(proposalGateReason(id)),
 			scope: projectScope(id),
 			evidence,
 			generationContext: evidence.length ? buildGenerationContext(id) : null,
@@ -80,15 +87,48 @@ export async function POST(request: NextRequest, context: Context) {
 	if (blocked) return NextResponse.json({ error: blocked }, { status: 409 })
 
 	const planned = body.plannedChapters === undefined ? 8 : Number(body.plannedChapters)
-	if (!Number.isInteger(planned) || planned < 1 || planned > 24) {
-		return NextResponse.json({ error: '计划章节数需为 1 至 24 的整数。' }, { status: 400 })
+	if (!Number.isInteger(planned) || planned < 1 || planned > MAX_PLAN_CHAPTERS) {
+		return NextResponse.json({ error: `计划章节数需为 1 至 ${MAX_PLAN_CHAPTERS} 的整数。` }, { status: 400 })
 	}
 
-	const payload = outlinePayload(id, planned)
-	const userPrompt = JSON.stringify(payload)
 	const configuration = getBailianConfiguration()
 	const mode = billingMode(configuration?.baseURL ?? process.env.BAILIAN_BASE_URL)
-	const estimate = estimateFor(userPrompt, mode, configuration?.writingModel ?? outlineModelId)
+	// 逐组调用：预览与确认都按「一次一组」的资料量折算，组数一并回显给界面。
+	const { prompt: groupPrompt, groups, estimate } = outlineEstimate(id, planned, mode, configuration?.writingModel ?? outlineModelId)
+
+	// 界面逐组推进：每次只生成一组章节，已生成部分留在浏览器里，最后一组返回可直接保存的整本规划。
+	if (body.action === 'generate-group' || body.action === 'finalize') {
+		if (body.action === 'generate-group' && body.allowExternalTransfer !== true) {
+			return NextResponse.json({ error: '生成章纲需要把已核定的史料片段发送到百炼，请先明确确认资料外发。' }, { status: 400 })
+		}
+		const from = Number(body.from)
+		if (body.action === 'generate-group' && (!Number.isInteger(from) || from < 1 || from > planned)) {
+			return NextResponse.json({ error: '本组起始章号无效，请从第 1 章重新开始。' }, { status: 400 })
+		}
+		const accumulated = Array.isArray(body.accumulated) ? (body.accumulated as Chapter[]) : []
+		const book = body.book && typeof body.book === 'object' ? (body.book as OutlineBookFrame) : null
+		try {
+			if (body.action === 'finalize') {
+				return NextResponse.json({ ...mergeOutlinePlan(id, { plannedChapters: planned, from: 1, accumulated, book }), groups, generated: accumulated.length })
+			}
+			const result = await generateOutlineGroup(id, { plannedChapters: planned, from, accumulated, book })
+			const merged = [...accumulated, ...result.chapters]
+			// 组内少给章节时界面会带着已有章数再请下一组，直到凑满计划章数或作者主动成稿。
+			if (merged.length < planned) return NextResponse.json({ ...result, generated: merged.length })
+			return NextResponse.json({
+				...mergeOutlinePlan(id, { plannedChapters: planned, from: 1, accumulated: merged, book: result.book }),
+				estimate: result.estimate,
+				usage: result.usage,
+				requestId: result.requestId,
+				lastGroup: { from: result.from, to: result.to, chapters: result.chapters.length },
+				groups: result.groups,
+				generated: merged.length,
+			})
+		} catch (error) {
+			if (error instanceof OutlineError) return NextResponse.json({ error: error.message }, { status: error.status })
+			return NextResponse.json({ error: '章纲分组生成状态未知；未写入任何规划，请先核对百炼请求记录。' }, { status: 502 })
+		}
+	}
 
 	// 默认只预览：先把将要外发的内容与用量上限摊开，授权之前不发送任何请求。
 	if (body.action === 'skeleton') {
@@ -109,7 +149,7 @@ export async function POST(request: NextRequest, context: Context) {
 		}
 	}
 	if (body.action !== 'generate') {
-		return NextResponse.json({ dryRun: true, prompt: { system: outlineSystemPrompt, user: payload }, estimate })
+		return NextResponse.json({ dryRun: true, prompt: { system: outlineSystemPrompt, user: groupPrompt }, estimate, groups, plannedChapters: planned })
 	}
 	if (body.allowExternalTransfer !== true) {
 		return NextResponse.json({ error: '生成大纲需要把已核定的史料片段发送到百炼，请先明确确认资料外发。' }, { status: 400 })

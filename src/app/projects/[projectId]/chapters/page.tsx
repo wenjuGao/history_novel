@@ -7,7 +7,7 @@ export default function ChaptersPage() {
 	const { projectId } = useParams<{ projectId: string }>();
 
 	return (
-		<div className="mx-auto w-full max-w-[72rem] px-6 py-6">
+		<div className="mx-auto flex h-full min-h-0 w-full max-w-[72rem] flex-col px-6 py-6">
 			<ChapterWorkspace projectId={projectId} />
 		</div>
 	);

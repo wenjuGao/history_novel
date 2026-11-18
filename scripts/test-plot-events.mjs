@@ -166,8 +166,17 @@ try {
 	assert.equal(preview.dryRun, true)
 	assert.ok(preview.estimate.inputTokenAllowance > 0)
 	assert.equal(preview.prompt.user.adoptedEvents.length, 2)
+	// 需求 2：章数放开到 1000，预览按「一次一组（最多 10 章）」回显调用次数与折算后的合计用量。
+	assert.equal(preview.groups, 1, '6 章一次调用即可')
+	const fullGroup = await call(outline, { plannedChapters: 10 })
+	assert.equal(fullGroup.groups, 1)
+	const grouped = await call(outline, { plannedChapters: 25 })
+	assert.equal(grouped.groups, 3)
+	assert.equal(grouped.estimate.maxOutputTokens, fullGroup.estimate.maxOutputTokens * 3, '输出上限按整组章数折算再乘组数')
+	assert.ok(Math.abs(grouped.estimate.inputTokenAllowance / 3 - fullGroup.estimate.inputTokenAllowance) < 64, '合计输入须是三次同规模调用的累加')
+	assert.match(grouped.prompt.user.instructions, /本次只输出第 1 至 10 章/)
 	await call(outline, { plannedChapters: 0 }, 400)
-	await call(outline, { plannedChapters: 40 }, 400)
+	await call(outline, { plannedChapters: 1001 }, 400)
 	await call(outline, { action: 'generate', plannedChapters: 4 }, 400)
 
 	const draft = {
@@ -306,6 +315,44 @@ try {
 	await call(events, { action: 'adopt', sourceKey: relationKey, confirmed: false }, 400)
 	await call(events, { action: 'update', id: pendingEvent.id, status: 'adopt' }, 400)
 	await call(events, { action: 'adopt', sourceKey: relationKey, confirmed: true })
+
+	// 需求 1：区域非必填，留空即不限区域，人物只凭时间证据匹配。
+	await call(scope, { startYear: 900, endYear: 910, region: '' }, 200, 'PUT')
+	const openRegion = await call(setup)
+	assert.equal(openRegion.scope.region, '', '保存的范围要原样记住“不限区域”')
+	assert.equal(openRegion.people.every((item) => item.match), true, '不限区域时活动年份落在区间内的人物都应匹配')
+	await call(scope, { startYear: 900, endYear: 910, region: '汴州、洛阳' }, 200, 'PUT')
+
+	// 需求 2：新增事件时可按「时间 ∩ 已勾选人物」检索真实记事；证据必须回到原文，采用后不再重复候选。
+	const corpusEvents = await call(`${events}/candidates?start=901&end=907`)
+	assert.equal(corpusEvents.ready, true, '请先执行 npm run corpus:years')
+	const selectedNames = new Set((await call(setup)).people.filter((item) => item.selected).map((item) => item.name))
+	const entryProbe = database.prepare('SELECT COUNT(*) AS count FROM corpus_volume WHERE book_id = ? AND volume_name = ? AND instr(text, ?) > 0')
+	for (const item of corpusEvents.candidates.slice(0, 10)) {
+		assert.ok(item.year >= 901 && item.year <= 907, `记事年份 ${item.year} 不在查询区间内`)
+		assert.ok(item.names.every((name) => selectedNames.has(name)), `候选带上了未勾选的人物：${item.names.join('、')}`)
+		assert.equal(entryProbe.get(item.bookId, item.volume, item.text).count > 0, true, `${item.volume} 里找不到该记事原文`)
+	}
+	const sample = corpusEvents.candidates.find((item) => item.documentId && item.participantIds.length > 0)
+	if (sample) {
+		const added = await call(events, {
+			action: 'add',
+			title: '通鉴记事采用',
+			kind: 'historical',
+			start: sample.year,
+			end: sample.year,
+			documentId: sample.documentId,
+			evidence: sample.text,
+			confirmed: true,
+			sourceKey: sample.key,
+			participants: sample.participantIds,
+		})
+		assert.equal(added.events.some((item) => item.sourceKey === sample.key), true, '采用后的事件应带着记事来源标记')
+		const reread = await call(`${events}/candidates?start=901&end=907`)
+		assert.ok(!reread.candidates.some((item) => item.key === sample.key), '已采用的记事不再重复出现在候选里')
+	} else {
+		assert.equal(corpusEvents.candidates.length, 0, '有记事却没有可采用的出处或人物，说明候选拼装漏了字段')
+	}
 
 	for (const event of (await call(events)).events) await call(events, { action: 'remove', id: event.id })
 	assert.equal((await call(outline)).evidence.length, 0)

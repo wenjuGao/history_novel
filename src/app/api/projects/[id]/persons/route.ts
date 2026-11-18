@@ -26,10 +26,11 @@ export async function GET(request: NextRequest, context: Context) {
 	if (!projectExists(id)) return NextResponse.json({ error: '作品不存在。' }, { status: 404 })
 	const limit = Math.min(Math.max(Number(new URL(request.url).searchParams.get('limit') ?? 120) || 120, 20), 400)
 	const scope = db.prepare('SELECT start_year AS startYear, end_year AS endYear, region FROM project_scope WHERE project_id = ?').get(id)
-	const { books, candidates, defaults, blocked } = corpusPersonCandidates(id, { limit })
+	const { books, candidates, pending, defaults, blocked, ready } = corpusPersonCandidates(id, { limit })
 	const known = new Set((db.prepare('SELECT name FROM characters WHERE project_id = ?').all(id) as Array<{ name: string }>).map((row) => row.name))
+	const withState = (list: typeof candidates) => list.map((candidate) => ({ ...candidate, imported: known.has(candidate.name) }))
 	return NextResponse.json(
-		{ scope: scope ?? null, books, defaults, blocked, candidates: candidates.map((candidate) => ({ ...candidate, imported: known.has(candidate.name) })) },
+		{ scope: scope ?? null, books, defaults, blocked, ready, candidates: withState(candidates), pending: withState(pending) },
 		{ headers: { 'cache-control': 'no-store' } },
 	)
 }

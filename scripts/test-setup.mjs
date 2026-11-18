@@ -29,6 +29,23 @@ state=await call(root+'/setup');assert.equal(state.people.filter(p=>p.match).len
 await call(root+'/setup',{action:'select',id:a.id,selected:true},'POST',400);
 await call(root+'/characters',{id:a.id,selected:true},'PATCH',400);
 await call(`/api/projects/${other}/setup`,{action:'select',id:a.id,selected:true},'POST',400);
+// 全选（需求 1）：逐条校验范围，不匹配与不属于本作品的编号原样跳过；一次批量只加一个版本；取消勾选不设范围门槛。
+const versionBefore=(await call('/api/projects')).projects.find(p=>p.id===project).version;
+const batch=await call(root+'/setup',{action:'selectMany',ids:[a.id,b.id,'不存在的人物'],selected:true});
+assert.equal(batch.selected,0,'范围不匹配时全选不勾选任何人');
+assert.deepEqual(batch.skipped,[a.id,b.id,'不存在的人物'],'跳过的编号原样回传，含不属于本作品的人物');
+assert.equal((await call('/api/projects')).projects.find(p=>p.id===project).version,versionBefore+1,'一次全选只加一个版本');
+await call(root+'/scope',{startYear:100,endYear:120,region:'测试甲地、测试乙地'},'PUT');
+const picked=await call(root+'/setup',{action:'selectMany',ids:[a.id,b.id,c.id],selected:true});
+assert.equal(picked.selected,3);assert.deepEqual(picked.skipped,[]);
+assert.equal((await call(root+'/setup')).people.filter(p=>p.selected).length,3,'全选结果落库');
+await call(root+'/scope',{startYear:200,endYear:220,region:'测试甲地'},'PUT');
+const cleared=await call(root+'/setup',{action:'selectMany',ids:[a.id,b.id],selected:false});
+assert.equal(cleared.selected,2,'取消勾选不需要匹配当前范围');
+assert.equal((await call(root+'/setup')).people.filter(p=>p.selected).length,1);
+await call(root+'/scope',{startYear:100,endYear:120,region:'测试甲地、测试乙地'},'PUT');
+await call(root+'/setup',{action:'selectMany',ids:[a.id],selected:'yes'},'POST',400);
+await call(root+'/setup',{action:'selectMany',selected:true},'POST',400);
 await call(root+'/setup',{action:'person',name:'无证据',region:'测试甲地',evidence:'不存在的引文',documentId,start:'100',end:'120',confirmed:true},'POST',400);
 await call(root+'/setup',{action:'person',name:'零年',region:'测试甲地',evidence:'甲在测试甲地活动。',documentId,start:'0',end:'120',confirmed:true},'POST',400);
 const f=state.fiction[0];await call(root+'/setup',{...f,action:'fiction',content:'修改后内容'});assert.equal((await call(root+'/setup')).fiction[0].content,'修改后内容');

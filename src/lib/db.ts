@@ -34,6 +34,8 @@ function ensureSchema(database: Database.Database) {
 	database.exec(readFileSync(path.join(process.cwd(), 'src/lib/migrations/008-project-reference-spec.sql'), 'utf8'))
 	database.exec(readFileSync(path.join(process.cwd(), 'src/lib/migrations/009-plot-proposals.sql'), 'utf8'))
 	database.exec(readFileSync(path.join(process.cwd(), 'src/lib/migrations/010-chapter-state.sql'), 'utf8'))
+	database.exec(readFileSync(path.join(process.cwd(), 'src/lib/migrations/012-draft-backups.sql'), 'utf8'))
+	database.exec(readFileSync(path.join(process.cwd(), 'src/lib/migrations/013-corpus-years.sql'), 'utf8'))
 	applyAddedColumns(database)
 	applyEvidenceReviewMigration(database)
 	applyApprovalLimitsMigration(database)

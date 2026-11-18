@@ -91,6 +91,7 @@ try {
 
 	// 4. 候选与强关联：默认勾选的每个人都必须能在固定原文里命中证据。
 	const persons = await call(`${personsRoute}?limit=20`)
+	assert.equal(persons.ready, true, '请先执行 npm run corpus:years，人物候选按年份档案筛选')
 	assert.ok(persons.defaults.length > 0, '范围内应给出默认候选')
 	assert.ok(persons.candidates.length >= persons.defaults.length)
 	const evidenceProbe = database.prepare('SELECT COUNT(*) AS count FROM corpus_volume WHERE book_id = ? AND instr(text, ?) > 0')
@@ -101,7 +102,33 @@ try {
 		assert.ok(candidate.evidence.length > 0, `${name} 缺少原文证据片段`)
 		assert.ok(scopeBookIds.has(candidate.evidenceBook), `${name} 的证据书目 ${candidate.evidenceBook} 不在固定范围内`)
 		assert.equal(evidenceProbe.get(candidate.evidenceBook, candidate.evidence).count > 0, true, `${name} 的证据不是固定原文的子串`)
+		// 需求 1：候选只能生活在所选区间内（区间有交集即入选），并带着可核对的生卒与事迹。
+		assert.equal(candidate.yearState, 'in-range', `${name} 的年份不该进入确定候选`)
+		assert.equal(candidate.profile?.plausible, true, `${name} 的年份档案不可信，不应混入确定候选`)
+		const from = candidate.profile?.birth ?? candidate.profile?.activeFrom
+		const to = candidate.profile?.death ?? candidate.profile?.activeTo
+		assert.ok(from <= endYear && to >= startYear, `${name} 的 ${from}—${to} 与 ${startYear}—${endYear} 没有交集`)
+		assert.ok(candidate.profile?.deeds.length > 0, `${name} 应展示主要事迹`)
 	}
+	assert.ok(persons.pending.every((item) => item.yearState === 'unknown'), '待核组不得混入按年份筛出的候选')
+	// 评审修复：年份可信但整体落在区间外的人（如 904—960 项目里的郭子儀）不是「待核」，须整体排除而不是换个标签。
+	assert.ok(persons.pending.every((item) => !item.profile || item.profile.plausible !== true), '年份可信却区间外的人物不得进入待核组')
+
+	// 4.1 区域非必填：留空即不限区域，候选仍只按年份区间筛选。
+	await call(`/api/projects/${projectId}/scope`, { startYear, endYear, region: '' }, 200, 'PUT')
+	const openRegion = await call(`${personsRoute}?limit=20`)
+	assert.deepEqual(
+		openRegion.candidates.map((item) => item.name),
+		persons.candidates.map((item) => item.name),
+		'区域留空不应改变按年份筛出的候选'
+	)
+	await call(`/api/projects/${projectId}/scope`, { startYear, endYear, region }, 200, 'PUT')
+
+	// 4.2 范围外不再给候选：把区间挪到通鉴开始之前，确定候选应为空并提示手工新增。
+	const outside = await call(`${eventsRoute}/candidates?start=-900&end=-800`)
+	assert.equal(outside.ready, true)
+	assert.equal(outside.candidates.length, 0, '早于史料覆盖范围时不应给出事件候选')
+	assert.match(outside.note, /请手工新增/)
 
 	// 5. 自动生成前锁定为本地模式，并确认未授权外发。
 	const settings = await call(autoRoute, { action: 'settings', outlineMode: 'local', allowExternalTransfer: false })

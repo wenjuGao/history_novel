@@ -19,8 +19,9 @@ export async function PUT(request: NextRequest, context: Context) {
   if (!db.prepare("SELECT id FROM projects WHERE id = ?").get(id)) return NextResponse.json({ error: "作品不存在。" }, { status: 404 });
   let body: { startYear?: unknown; endYear?: unknown; region?: unknown };
   try { body = await request.json(); } catch { return NextResponse.json({ error: "请求内容无效。" }, { status: 400 }); }
-  if (!body || !Number.isInteger(body.startYear) || !Number.isInteger(body.endYear) || typeof body.region !== "string" || !body.region.trim() || body.region.trim().length > 200 || (body.startYear as number) > (body.endYear as number) || Math.abs(body.startYear as number) > 10000 || Math.abs(body.endYear as number) > 10000) {
-    return NextResponse.json({ error: "请输入有效的起止年份和区域；起始年份不能晚于结束年份。" }, { status: 400 });
+  // 区域可留空（存空串），语义为「不限区域」；起止年份仍是硬要求，候选名单按区间查预处理数据。
+  if (!body || !Number.isInteger(body.startYear) || !Number.isInteger(body.endYear) || typeof body.region !== "string" || body.region.trim().length > 200 || (body.startYear as number) > (body.endYear as number) || Math.abs(body.startYear as number) > 10000 || Math.abs(body.endYear as number) > 10000) {
+    return NextResponse.json({ error: "请输入有效的起止年份；起始年份不能晚于结束年份。" }, { status: 400 });
   }
   const region = body.region.trim();
   db.transaction(() => {
