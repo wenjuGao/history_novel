@@ -2,6 +2,7 @@ import 'server-only'
 
 import { randomUUID } from 'node:crypto'
 import { db } from '@/lib/db'
+import type { RevealCue } from '@/lib/plot-events'
 
 export type EventWriteInput = {
 	title: string
@@ -14,6 +15,9 @@ export type EventWriteInput = {
 	evidence: string
 	documentId: string | null
 	participantIds: string[]
+	/** 该事件体现的性格与精神风貌，与其线索来源；缺省时留空，由调用方在界面补写。 */
+	reveal?: string
+	cues?: RevealCue[]
 }
 
 export type EventWriteOptions = {
@@ -31,8 +35,8 @@ export function writeEvent(projectId: string, input: EventWriteInput, options: E
 	const now = new Date().toISOString()
 	const status = options.status ?? 'adopted'
 	db.prepare(
-		`INSERT INTO plot_events(id, project_id, title, summary, kind, status, origin, source_key, document_id, evidence, region, start_year, end_year, created_at, updated_at, needs_review, verified_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO plot_events(id, project_id, title, summary, kind, status, origin, source_key, document_id, evidence, region, start_year, end_year, created_at, updated_at, needs_review, verified_at, reveal, reveal_cues)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	).run(
 		eventId,
 		projectId,
@@ -51,6 +55,8 @@ export function writeEvent(projectId: string, input: EventWriteInput, options: E
 		now,
 		status === 'adopted' ? (options.verifiedAt ? 0 : 1) : 0,
 		options.verifiedAt ?? null,
+		input.reveal ?? '',
+		JSON.stringify(input.cues ?? []),
 	)
 	for (const characterId of input.participantIds) {
 		db.prepare('INSERT OR IGNORE INTO plot_event_participants(event_id, character_id) VALUES (?, ?)').run(eventId, characterId)

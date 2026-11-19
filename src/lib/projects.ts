@@ -50,8 +50,9 @@ export function resolveProjectEntry(projectId: string): ProjectEntryStep {
 	// 古籍固定是证据校验的前提；参考小说固定决定写作规格可用性。
 	if (!has('SELECT 1 FROM project_corpus WHERE project_id = ? LIMIT 1')) return 'references'
 	if (!has('SELECT 1 FROM project_reference WHERE project_id = ? LIMIT 1')) return 'references'
-	if (!has('SELECT 1 FROM characters WHERE project_id = ? AND selected = 1 LIMIT 1')) return 'persons'
+	// 以事件为主：先采用事件（采用时按人名去重带出人物），再回到人物步骤配置性格与风貌。
 	if (!has("SELECT 1 FROM plot_events WHERE project_id = ? AND status = 'adopted' AND kind = 'historical' AND needs_review = 0 LIMIT 1")) return 'events'
+	if (!has('SELECT 1 FROM characters WHERE project_id = ? AND selected = 1 LIMIT 1')) return 'persons'
 	// REQ-056：章纲必须绑定选定提案，未选定回到提案步骤。
 	if (!has("SELECT 1 FROM plot_proposals WHERE project_id = ? AND status = 'selected' LIMIT 1")) return 'proposals'
 	if (!has('SELECT 1 FROM story_plans WHERE project_id = ? LIMIT 1')) return 'outline'

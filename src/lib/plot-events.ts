@@ -5,11 +5,16 @@ import { astronomicalToHistorical } from '@/lib/history-time'
 import { activeReferenceSpec } from '@/lib/reference-spec'
 import type { GenerationContext } from '@/lib/story-plan'
 
+export type RevealCue = { kind: string; word: string; span: string }
+
 export type PlotEvent = {
 	id: string | null
 	sourceKey: string | null
 	title: string
 	summary: string
+	/** 该事件体现的人物性格与精神风貌；由品性线索落底，作者可改写。 */
+	reveal: string
+	cues: RevealCue[]
 	kind: 'historical' | 'fiction'
 	status: 'candidate' | 'adopted' | 'rejected'
 	origin: 'derived' | 'manual'
@@ -39,9 +44,24 @@ type EventRow = {
 	region: string
 	start_year: number
 	end_year: number
+	reveal?: string
+	reveal_cues?: string
 }
 
 const maxEvidence = 60
+
+function parseCues(value: string | undefined): RevealCue[] {
+	try {
+		const parsed = JSON.parse(value ?? '[]')
+		if (!Array.isArray(parsed)) return []
+		return parsed
+			.filter((cue) => cue && typeof cue.word === 'string' && typeof cue.kind === 'string')
+			.slice(0, 6)
+			.map((cue) => ({ kind: String(cue.kind).slice(0, 12), word: String(cue.word).slice(0, 40), span: String(cue.span ?? '').slice(0, 160) }))
+	} catch {
+		return []
+	}
+}
 
 function participantRows(eventIds: string[]) {
 	if (!eventIds.length) return new Map<string, Array<{ id: string; name: string; participation: string }>>()
@@ -68,6 +88,8 @@ function toEvent(row: EventRow, participants: Array<{ id: string; name: string; 
 		sourceKey: row.source_key,
 		title: row.title,
 		summary: row.summary,
+		reveal: row.reveal ?? '',
+		cues: parseCues(row.reveal_cues),
 		kind: row.kind === 'fiction' ? 'fiction' : 'historical',
 		status: (row.status as PlotEvent['status']) ?? 'candidate',
 		origin: (row.origin as PlotEvent['origin']) ?? 'manual',
@@ -86,7 +108,7 @@ export function storedEvents(projectId: string): PlotEvent[] {
 	const rows = db
 		.prepare(
 			`SELECT e.id, e.source_key, e.title, e.summary, e.kind, e.status, e.origin, e.needs_review, e.document_id,
-				d.title AS document_title, e.evidence, e.region, e.start_year, e.end_year
+				d.title AS document_title, e.evidence, e.region, e.start_year, e.end_year, e.reveal, e.reveal_cues
 			 FROM plot_events e LEFT JOIN documents d ON d.id = e.document_id
 			 WHERE e.project_id = ? ORDER BY e.start_year, e.created_at`,
 		)
@@ -200,15 +222,31 @@ export function derivedCandidates(projectId: string): PlotEvent[] {
 
 export type OutlineEvidence = { id: string; event: PlotEvent }
 
+/** 可作依据的已采用历史事件（带原文证据、已人工核对），按年代排列；未受入请求上限影响的全量。 */
+export function adoptedEvidenceEvents(projectId: string): PlotEvent[] {
+	return storedEvents(projectId).filter(
+		(event) => event.status === 'adopted' && event.kind === 'historical' && event.evidence.trim() && !event.needsReview,
+	)
+}
+
+// 超出上限时按年代均匀取样，始终保留最早与最晚一条：截成「最早 N 条」会让后半程完全没有依据可引。
+function spreadToLimit(events: PlotEvent[], limit: number): PlotEvent[] {
+	if (events.length <= limit) return events
+	const span = events.length - 1
+	const taken = new Set<number>()
+	for (let index = 0; index < limit; index += 1) taken.add(Math.round((index * span) / (limit - 1)))
+	return [...taken].sort((left, right) => left - right).map((index) => events[index]!)
+}
+
 // Evidence ids are positional over the adopted historical events, so editing the adopted set
 // changes the ids; the outline route re-checks every citation against this list.
 // 待复核的旧派生事件不算可用依据：作者核对确认后才重新进入。
 export function outlineEvidence(projectId: string): OutlineEvidence[] {
-	return storedEvents(projectId)
-		.filter((event) => event.status === 'adopted' && event.kind === 'historical' && event.evidence.trim() && !event.needsReview)
-		.slice(0, maxEvidence)
-		.map((event, index) => ({ id: `E${index + 1}`, event }))
+	return spreadToLimit(adoptedEvidenceEvents(projectId), maxEvidence).map((event, index) => ({ id: `E${index + 1}`, event }))
 }
+
+/** 章纲一次请求最多带走的证据条数；容量校验据此区分「全量」与「实际入请求」。 */
+export const outlineEvidenceCap = maxEvidence
 
 export function projectScope(projectId: string) {
 	const row = db.prepare('SELECT start_year, end_year, region FROM project_scope WHERE project_id = ?').get(projectId) as

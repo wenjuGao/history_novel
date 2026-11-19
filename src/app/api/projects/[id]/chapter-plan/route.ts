@@ -48,7 +48,7 @@ function previousChapterOf(projectId: string) {
 function blockReason(projectId: string) {
 	if (!readPlan(projectId)) return '请先生成或保存故事规划。'
 	if (!projectScope(projectId)) return '请先在第 01 步设定历史范围。'
-	if (!outlineEvidence(projectId).length) return '请先在第 04 步采用至少一个带原文证据的历史事件。'
+	if (!outlineEvidence(projectId).length) return '请先在第 03 步采用至少一个带原文证据的历史事件。'
 	// 章节设定最终要写回章纲：提案绑定已过期时先拦下，避免花 Token 生成一份保存不进去的章节。
 	const proposal = proposalGateReason(projectId)
 	if (proposal) return proposal

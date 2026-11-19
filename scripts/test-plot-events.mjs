@@ -323,14 +323,15 @@ try {
 	assert.equal(openRegion.people.every((item) => item.match), true, '不限区域时活动年份落在区间内的人物都应匹配')
 	await call(scope, { startYear: 900, endYear: 910, region: '汴州、洛阳' }, 200, 'PUT')
 
-	// 需求 2：新增事件时可按「时间 ∩ 已勾选人物」检索真实记事；证据必须回到原文，采用后不再重复候选。
+	// 需求 2（以事件为主）：第 03 步按时间阶段列出体现人物性格与风貌的记事，人名只标注、不作前提；证据必须回到原文。
 	const corpusEvents = await call(`${events}/candidates?start=901&end=907`)
 	assert.equal(corpusEvents.ready, true, '请先执行 npm run corpus:years')
-	const selectedNames = new Set((await call(setup)).people.filter((item) => item.selected).map((item) => item.name))
+	const knownNames = new Set((await call(setup)).people.map((item) => item.name))
 	const entryProbe = database.prepare('SELECT COUNT(*) AS count FROM corpus_volume WHERE book_id = ? AND volume_name = ? AND instr(text, ?) > 0')
 	for (const item of corpusEvents.candidates.slice(0, 10)) {
 		assert.ok(item.year >= 901 && item.year <= 907, `记事年份 ${item.year} 不在查询区间内`)
-		assert.ok(item.names.every((name) => selectedNames.has(name)), `候选带上了未勾选的人物：${item.names.join('、')}`)
+		assert.ok(item.tier === 1 || item.tier === 2, `候选里混入了非品性记事：tier ${item.tier}`)
+		assert.deepEqual(item.missingNames, item.names.filter((name) => !knownNames.has(name)), `未建档人名要标成待建：${item.names.join('、')}`)
 		assert.equal(entryProbe.get(item.bookId, item.volume, item.text).count > 0, true, `${item.volume} 里找不到该记事原文`)
 	}
 	const sample = corpusEvents.candidates.find((item) => item.documentId && item.participantIds.length > 0)
@@ -349,7 +350,10 @@ try {
 		})
 		assert.equal(added.events.some((item) => item.sourceKey === sample.key), true, '采用后的事件应带着记事来源标记')
 		const reread = await call(`${events}/candidates?start=901&end=907`)
-		assert.ok(!reread.candidates.some((item) => item.key === sample.key), '已采用的记事不再重复出现在候选里')
+		const rereadItem = reread.candidates.find((item) => item.key === sample.key)
+		assert.equal(rereadItem?.adopted, true, '已采用的记事要留在列表里并标「已采用」')
+		const again = await call(events, { action: 'adoptMany', items: [{ key: sample.key, confirmed: true }] }, 400)
+		assert.match(again.error, /该记事已采用过/, '同一记事不能被采用两次')
 	} else {
 		assert.equal(corpusEvents.candidates.length, 0, '有记事却没有可采用的出处或人物，说明候选拼装漏了字段')
 	}

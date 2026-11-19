@@ -10,10 +10,12 @@ import { activeReferenceSpec } from '@/lib/reference-spec'
 import { commitPlan, parsePlan, PlanVersionError, readPlan, sha256, validPlan, type Chapter } from '@/lib/story-plan'
 import { MAX_PLAN_CHAPTERS } from '@/lib/plan-limits'
 import {
+	capacityBlockReason,
 	generateOutline,
 	generateOutlineGroup,
 	mergeOutlinePlan,
 	outlineBlockReason,
+	outlineCapacity,
 	outlineEstimate,
 	outlineModelId,
 	outlineSystemPrompt,
@@ -51,6 +53,8 @@ export async function GET(request: NextRequest, context: Context) {
 			// 提案类拦截是「可绕过补齐」的：界面保留重新生成入口与跳转，范围/证据/规格类拦截才整块收起操作区。
 			proposalBlocked: Boolean(proposalGateReason(id)),
 			scope: projectScope(id),
+			// 证据容量：界面在点「生成」之前就能看出「计划章数撑不起」，而不是跑到最后一组才整本作废。
+			capacity: outlineCapacity(id),
 			evidence,
 			generationContext: evidence.length ? buildGenerationContext(id) : null,
 			model: configuration?.writingModel ?? outlineModelId,
@@ -95,11 +99,17 @@ export async function POST(request: NextRequest, context: Context) {
 	const mode = billingMode(configuration?.baseURL ?? process.env.BAILIAN_BASE_URL)
 	// 逐组调用：预览与确认都按「一次一组」的资料量折算，组数一并回显给界面。
 	const { prompt: groupPrompt, groups, estimate } = outlineEstimate(id, planned, mode, configuration?.writingModel ?? outlineModelId)
+	const capacity = outlineCapacity(id, planned)
 
 	// 界面逐组推进：每次只生成一组章节，已生成部分留在浏览器里，最后一组返回可直接保存的整本规划。
 	if (body.action === 'generate-group' || body.action === 'finalize') {
 		if (body.action === 'generate-group' && body.allowExternalTransfer !== true) {
 			return NextResponse.json({ error: '生成章纲需要把已核定的史料片段发送到百炼，请先明确确认资料外发。' }, { status: 400 })
+		}
+		// 容量拦截发在任何模型请求之前：计划章数超出证据可支撑量时先让作者补事件或改成稿章数。
+		if (body.action === 'generate-group' && body.overrideCapacity !== true) {
+			const overCapacity = capacityBlockReason(id, planned)
+			if (overCapacity) return NextResponse.json({ error: overCapacity, capacity }, { status: 409 })
 		}
 		const from = Number(body.from)
 		if (body.action === 'generate-group' && (!Number.isInteger(from) || from < 1 || from > planned)) {
@@ -149,10 +159,14 @@ export async function POST(request: NextRequest, context: Context) {
 		}
 	}
 	if (body.action !== 'generate') {
-		return NextResponse.json({ dryRun: true, prompt: { system: outlineSystemPrompt, user: groupPrompt }, estimate, groups, plannedChapters: planned })
+		return NextResponse.json({ dryRun: true, prompt: { system: outlineSystemPrompt, user: groupPrompt }, estimate, groups, capacity, plannedChapters: planned })
 	}
 	if (body.allowExternalTransfer !== true) {
 		return NextResponse.json({ error: '生成大纲需要把已核定的史料片段发送到百炼，请先明确确认资料外发。' }, { status: 400 })
+	}
+	if (body.overrideCapacity !== true) {
+		const overCapacity = capacityBlockReason(id, planned)
+		if (overCapacity) return NextResponse.json({ error: overCapacity, capacity }, { status: 409 })
 	}
 
 	try {

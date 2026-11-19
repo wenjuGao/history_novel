@@ -23,8 +23,8 @@ export function useProject() {
 const steps: Array<{ slug: string; title: string }> = [
 	{ slug: "scope", title: "范围与史料" },
 	{ slug: "references", title: "参考资料" },
-	{ slug: "persons", title: "人物" },
 	{ slug: "events", title: "事件" },
+	{ slug: "persons", title: "人物" },
 	{ slug: "proposals", title: "剧情提案" },
 	{ slug: "outline", title: "章纲" },
 ];

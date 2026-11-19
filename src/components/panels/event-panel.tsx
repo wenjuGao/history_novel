@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { Check, LoaderCircle, Plus, RotateCcw, Search, ShieldCheck, Trash2, Undo2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Check, Layers, LoaderCircle, Plus, RotateCcw, ShieldCheck, Trash2, Undo2, Users } from "lucide-react";
 import { toast } from "sonner";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -17,11 +17,14 @@ import { Textarea } from "@/components/ui/textarea";
 import { astronomicalToHistorical } from "@/lib/history-time";
 
 type Participant = { id: string; name: string; participation: string };
+type Cue = { kind: string; word: string; span: string };
 type PlotEvent = {
 	id: string | null;
 	sourceKey: string | null;
 	title: string;
 	summary: string;
+	reveal: string;
+	cues: Cue[];
 	kind: "historical" | "fiction";
 	status: "candidate" | "adopted" | "rejected";
 	origin: "derived" | "manual";
@@ -34,18 +37,20 @@ type PlotEvent = {
 	end: number;
 	participants: Participant[];
 };
+type Person = { id: string; name: string; selected: number };
 type Data = {
 	scope: { startYear: number; endYear: number; region: string; regions: string[] } | null;
 	events: PlotEvent[];
 	candidates: PlotEvent[];
-	people: Array<{ id: string; name: string; selected: number }>;
+	people: Person[];
 	sources: Array<{ id: string; title: string }>;
 };
 
-/** 史料候选事件：带年纪事按「时间 ∩ 已勾选人物」检索得到，年份为天文纪年，展示时转历史纪年。 */
-type CorpusEvent = {
+/** 时间阶段内的史料记事：年份为天文纪年，展示时转历史纪年；tier 1 才带品性线索。 */
+type StageEvent = {
 	key: string;
 	year: number;
+	yearLabel: string;
 	period: string;
 	text: string;
 	title: string;
@@ -55,10 +60,26 @@ type CorpusEvent = {
 	url: string;
 	names: string[];
 	participantIds: string[];
+	missingNames: string[];
+	cues: Cue[];
+	tier: number;
+	adopted: boolean;
 };
-type CorpusResult = { ready: boolean; candidates: CorpusEvent[]; note: string };
+type StageResult = {
+	ready: boolean;
+	candidates: StageEvent[];
+	note: string;
+	total: number;
+	kinds: Array<{ kind: string; count: number }>;
+	people: number;
+};
+/** 勾选记事去重带出的人物预览。 */
+type BroughtPerson = { name: string; characterId: string | null; eventCount: number; firstYear: number | null; lastYear: number | null };
 
-const statusText: Record<PlotEvent["status"], string> = { candidate: "待核对", adopted: "已采用", rejected: "已排除" };const statusVariant: Record<PlotEvent["status"], "success" | "warning" | "outline"> = {
+const pageSize = 60;
+const tierText: Record<number, string> = { 1: "体现性格与风貌", 2: "战政行动", 3: "除拜赠谥等事务" };
+const statusText: Record<PlotEvent["status"], string> = { candidate: "待核对", adopted: "已采用", rejected: "已排除" };
+const statusVariant: Record<PlotEvent["status"], "success" | "warning" | "outline"> = {
 	candidate: "warning",
 	adopted: "success",
 	rejected: "outline",
@@ -69,17 +90,23 @@ function inScope(event: PlotEvent, scope: Data["scope"]) {
 	return event.end >= scope.startYear && event.start <= scope.endYear;
 }
 
+function yearLabel(event: { start: number; end: number }) {
+	return event.start === event.end ? `${event.start} 年` : `${event.start}—${event.end} 年`;
+}
+
 type Draft = {
 	id: string;
 	sourceKey: string | null;
 	title: string;
 	summary: string;
+	reveal: string;
 	kind: "historical" | "fiction";
 	region: string;
 	start: string;
 	end: string;
 	documentId: string;
 	evidence: string;
+	cues: Cue[];
 	confirmed: boolean;
 	participants: string[];
 };
@@ -89,12 +116,14 @@ const blank: Draft = {
 	sourceKey: null,
 	title: "",
 	summary: "",
+	reveal: "",
 	kind: "historical",
 	region: "",
 	start: "",
 	end: "",
 	documentId: "",
 	evidence: "",
+	cues: [],
 	confirmed: false,
 	participants: [],
 };
@@ -105,15 +134,36 @@ function toDraft(event: PlotEvent): Draft {
 		sourceKey: event.sourceKey,
 		title: event.title,
 		summary: event.summary,
+		reveal: event.reveal,
 		kind: event.kind,
 		region: event.region,
 		start: String(event.start),
 		end: String(event.end),
 		documentId: event.documentId ?? "",
 		evidence: event.evidence,
+		cues: event.cues,
 		// 采用与复核都必须显式勾选核对，不因已有证据而预勾选。
 		confirmed: false,
 		participants: event.participants.map((person) => person.id),
+	};
+}
+
+/** 从记事直接起稿：证据与年代取本机史料，品性描述由线索落底，作者可在弹窗里改写。 */
+function draftFromStage(item: StageEvent, scope: Data["scope"]): Draft {
+	const year = String(astronomicalToHistorical(item.year));
+	return {
+		...blank,
+		sourceKey: item.key,
+		title: item.title,
+		summary: item.text,
+		reveal: item.cues.map((cue) => `${cue.kind}：${cue.span || cue.word}`).join("；"),
+		region: scope?.region ?? "",
+		start: year,
+		end: year,
+		documentId: item.documentId ?? "",
+		evidence: item.text,
+		cues: item.cues,
+		participants: item.participantIds,
 	};
 }
 
@@ -123,48 +173,16 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 	const [busy, setBusy] = useState<string | null>(null);
 	const [draft, setDraft] = useState<Draft | null>(null);
 	const [saving, setSaving] = useState(false);
+	// 勾选即人工断言「已核对原文」，同时把这条记事选入批量采用；未勾选的条目不会写入。
 	const [checked, setChecked] = useState<Set<string>>(new Set());
 	const [verifyTarget, setVerifyTarget] = useState<PlotEvent | null>(null);
 	const [verifyConfirmed, setVerifyConfirmed] = useState(false);
-	const [corpus, setCorpus] = useState<CorpusResult | null>(null);
-	const [corpusBusy, setCorpusBusy] = useState(false);
-
-	async function loadCorpus(start: string, end: string) {
-		setCorpusBusy(true);
-		try {
-			const params = new URLSearchParams({ start, end, limit: "40" });
-			const response = await fetch(`/api/projects/${projectId}/events/candidates?${params.toString()}`, { cache: "no-store" });
-			const result = (await response.json()) as CorpusResult & { error?: string };
-			if (!response.ok) throw new Error(result.error ?? "无法读取史料候选。");
-			setCorpus(result);
-		} catch (cause) {
-			setCorpus(null);
-			toast.error(cause instanceof Error ? cause.message : "无法读取史料候选。");
-		} finally {
-			setCorpusBusy(false);
-		}
-	}
-
-	function toggleChecked(key: string) {
-		setChecked((current) => {
-			const next = new Set(current);
-			if (next.has(key)) next.delete(key);
-			else next.add(key);
-			return next;
-		});
-	}
-
-	// 勾选＝人工断言已核对原文，批量写入只覆盖传入的 key，不会动另一列的核对状态。
-	function markChecked(keys: string[], value: boolean) {
-		setChecked((current) => {
-			const next = new Set(current);
-			for (const key of keys) {
-				if (value) next.add(key);
-				else next.delete(key);
-			}
-			return next;
-		});
-	}
+	const [stage, setStage] = useState<StageResult | null>(null);
+	const [stageBusy, setStageBusy] = useState(false);
+	const [stageMore, setStageMore] = useState(false);
+	const [kind, setKind] = useState<string | null>(null);
+	const [administrative, setAdministrative] = useState(false);
+	const [brought, setBrought] = useState<BroughtPerson[] | null>(null);
 
 	const load = useCallback(
 		async (signal?: AbortSignal) => {
@@ -187,6 +205,80 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 		return () => controller.abort();
 	}, [projectId, load]);
 
+	// 主列表＝第 01 步时间阶段内的史料记事；换范围或换筛选条件都从第一页重新取。
+	const loadStage = useCallback(
+		async (options: { offset?: number; kindFilter?: string | null; showAdministrative?: boolean } = {}, signal?: AbortSignal) => {
+			const scope = data?.scope;
+			if (!scope) return;
+			const useOffset = options.offset ?? 0;
+			const params = new URLSearchParams({ start: String(scope.startYear), end: String(scope.endYear), limit: String(pageSize), offset: String(useOffset) });
+			const activeKind = options.kindFilter ?? kind;
+			const activeAdmin = options.showAdministrative ?? administrative;
+			if (activeKind) params.set("kind", activeKind);
+			if (activeAdmin) params.set("administrative", "1");
+			if (useOffset > 0) setStageMore(true);
+			else setStageBusy(true);
+			try {
+				const response = await fetch(`/api/projects/${projectId}/events/candidates?${params.toString()}`, { cache: "no-store", signal });
+				const result = (await response.json()) as StageResult & { error?: string };
+				if (!response.ok) throw new Error(result.error ?? "无法读取该时间阶段的史料记事。");
+				setStage((current) => {
+					const merged = useOffset > 0 && current ? [...current.candidates, ...result.candidates] : result.candidates;
+					return { ...result, candidates: merged };
+				});
+			} catch (cause) {
+				if (cause instanceof Error && cause.name === "AbortError") return;
+				toast.error(cause instanceof Error ? cause.message : "无法读取该时间阶段的史料记事。");
+			} finally {
+				setStageBusy(false);
+				setStageMore(false);
+			}
+		},
+		[projectId, data?.scope, kind, administrative],
+	);
+
+	useEffect(() => {
+		const controller = new AbortController();
+		if (data?.scope) void loadStage({ offset: 0 }, controller.signal);
+		return () => controller.abort();
+	}, [data?.scope, kind, administrative, loadStage]);
+
+	const selectedKeys = useMemo(() => [...checked], [checked]);
+
+	// 选中的记事一变就回读去重后的人物，作者据此知道下一步会带出谁。
+	useEffect(() => {
+		if (!selectedKeys.length) {
+			setBrought(null);
+			return;
+		}
+		const controller = new AbortController();
+		fetch(`/api/projects/${projectId}/events/persons?keys=${encodeURIComponent(selectedKeys.join(","))}`, { cache: "no-store", signal: controller.signal })
+			.then(async (response) => (response.ok ? ((await response.json()) as { persons: BroughtPerson[] }) : null))
+			.then((result) => setBrought(result?.persons ?? null))
+			.catch(() => undefined);
+		return () => controller.abort();
+	}, [projectId, selectedKeys.join(",")]);
+
+	function toggleChecked(key: string) {
+		setChecked((current) => {
+			const next = new Set(current);
+			if (next.has(key)) next.delete(key);
+			else next.add(key);
+			return next;
+		});
+	}
+
+	function markChecked(keys: string[], value: boolean) {
+		setChecked((current) => {
+			const next = new Set(current);
+			for (const key of keys) {
+				if (value) next.add(key);
+				else next.delete(key);
+			}
+			return next;
+		});
+	}
+
 	async function send(payload: Record<string, unknown>, key: string) {
 		setBusy(key);
 		try {
@@ -195,17 +287,52 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify(payload),
 			});
-			const result = (await response.json()) as { events?: PlotEvent[]; candidates?: PlotEvent[]; error?: string };
+			const result = (await response.json()) as Data & { persons?: Person[]; adoptedCount?: number; skipped?: Array<{ key: string; reason: string }>; error?: string };
 			if (!response.ok) throw new Error(result.error ?? "保存失败。");
-			setData((current) => (current ? { ...current, events: result.events ?? [], candidates: result.candidates ?? [] } : current));
+			setData((current) =>
+				current ? { ...current, events: result.events ?? [], candidates: result.candidates ?? [], people: result.people ?? current.people } : current,
+			);
+			// 批量采用与记事补写都会新建人物，重新读一次才能拿到去重后的人物清单。
+			if (payload.action === "adoptMany" || payload.action === "add") await load();
+			setStage((current) =>
+				current
+					? {
+							...current,
+							candidates: current.candidates.map((item) =>
+								selectedKeys.includes(item.key) || item.key === payload.sourceKey ? { ...item, adopted: true } : item,
+							),
+						}
+					: current,
+			);
 			onChanged?.();
-			return true;
+			return result;
 		} catch (cause) {
 			toast.error(cause instanceof Error ? cause.message : "保存失败。");
-			return false;
+			return null;
 		} finally {
 			setBusy(null);
 		}
+	}
+
+	async function adoptSelected() {
+		const items = (stage?.candidates ?? [])
+			.filter((item) => checked.has(item.key) && !item.adopted)
+			.map((item) => ({ key: item.key, confirmed: true, title: item.title, summary: item.text, reveal: "", cues: item.cues }));
+		if (!items.length) {
+			toast.error("请先逐条勾选「已核对原文」。");
+			return;
+		}
+		const result = await send({ action: "adoptMany", items }, "adoptMany");
+		if (!result) return;
+		const skipped = result.skipped ?? [];
+		markChecked(skipped.map((item) => item.key), false);
+		toast.success(
+			skipped.length
+				? `已采用 ${result.adoptedCount ?? 0} 条，跳过 ${skipped.length} 条（${skipped[0].reason}）。`
+				: `已采用 ${result.adoptedCount ?? 0} 条事件，请到第 04 步配置人物性格与精神风貌。`,
+		);
+		setChecked(new Set());
+		setBrought(null);
 	}
 
 	async function submit() {
@@ -217,6 +344,8 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 			sourceKey: draft.id ? undefined : (draft.sourceKey ?? undefined),
 			title: draft.title,
 			summary: draft.summary,
+			reveal: draft.reveal,
+			cues: draft.cues,
 			kind: draft.kind,
 			region: draft.region,
 			start: draft.start,
@@ -225,35 +354,16 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 			evidence: draft.evidence,
 			confirmed: draft.confirmed,
 			participants: draft.participants,
+			// 记事里出现但本作尚未建档的人名，保存时一并带出为待核人物。
+			bringPeople: !draft.id && Boolean(draft.sourceKey?.startsWith("corpus:")),
 			status: "adopted",
 		};
-		const ok = await send(payload, "form");
+		const result = await send(payload, "form");
 		setSaving(false);
-		if (ok) {
+		if (result) {
 			setDraft(null);
-			setCorpus(null);
-			toast.success(draft.id ? "事件已更新并采用。" : "事件已新增并采用。");
+			toast.success(draft.id ? "事件已更新并采用。" : "事件已采用，参与人物已带出。");
 		}
-	}
-
-	// 填入只替换证据、出处与年份，事件名称保留作者已经写好的措辞。
-	function fillFromCorpus(item: CorpusEvent) {
-		setDraft((current) =>
-			current
-				? {
-						...current,
-						title: current.title.trim() || item.title,
-						start: String(astronomicalToHistorical(item.year)),
-						end: String(astronomicalToHistorical(item.year)),
-						evidence: item.text,
-						documentId: item.documentId ?? current.documentId,
-						participants: [...new Set([...current.participants, ...item.participantIds])],
-						sourceKey: item.key,
-						confirmed: false,
-					}
-				: current,
-		);
-		toast.success("已填入该条史料记事，请核对原文后保存。");
 	}
 
 	if (failed) {
@@ -274,13 +384,15 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 	}
 
 	const adopted = data.events.filter((event) => event.status === "adopted" && event.kind === "historical").length;
-	// 批量标记只作用于范围内、可逐条核对的条目；范围外条目仍需人工改年份或调整第 01 步范围。
-	const candidateKeys = data.candidates.filter((candidate) => inScope(candidate, data.scope)).map((candidate) => candidate.sourceKey ?? candidate.title);
-	const candidateUnchecked = candidateKeys.filter((key) => !checked.has(key));
-	const candidateChecked = candidateKeys.filter((key) => checked.has(key));
+	const listed = stage?.candidates ?? [];
+	const selectableKeys = listed.filter((item) => !item.adopted && Boolean(item.documentId)).map((item) => item.key);
+	const selectableUnchecked = selectableKeys.filter((key) => !checked.has(key));
+	const selectableChecked = selectableKeys.filter((key) => checked.has(key));
 	const storedKeys = data.events.filter((event) => event.status === "candidate" && inScope(event, data.scope)).map((event) => event.id ?? "");
 	const storedUnchecked = storedKeys.filter((key) => !checked.has(key));
 	const storedChecked = storedKeys.filter((key) => checked.has(key));
+	const selectedCount = selectableChecked.length;
+	const newPeople = (brought ?? []).filter((person) => !person.characterId).length;
 	// 服务端限制单条事件最多 12 位参与人物，全选只补到上限，避免保存时才报错。
 	const participantAdds = draft
 		? data.people
@@ -292,92 +404,175 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 	return (
 		<div className="flex flex-col gap-3">
 			<p className="text-[12px] leading-relaxed text-muted-foreground">
-				候选来自已核定的人物活动与已核对关系，采用前须逐条核对原文；旧派生事件在复核确认前不用于新章纲与正文。范围：
-				{data.scope ? `${data.scope.startYear} 至 ${data.scope.endYear} 年 · ${data.scope.region}` : "尚未设定"}。
+				以事件为主：先在第 01 步的时间阶段里挑出「史料已写出人物性格与精神风貌」的记事，逐条核对原文后批量采用；
+				采用时按人名去重带出人物，再到第 04 步配置性格与风貌。范围：
+				{data.scope ? `${data.scope.startYear} 至 ${data.scope.endYear} 年 · ${data.scope.region}` : "尚未设定，请先在第 01 步填写"}。
 			</p>
 
-			<div className="flex items-center justify-between gap-2">
-				<p className="text-[11px] tracking-[0.16em] text-muted-foreground uppercase">已采用 {adopted} 条历史事件</p>
+			{!data.scope && (
+				<Alert>
+					<AlertDescription>还没有历史范围，无法列出该阶段的记事。</AlertDescription>
+				</Alert>
+			)}
+
+			<div className="flex flex-wrap items-center justify-between gap-2">
+				<p className="flex items-center gap-1.5 text-[11px] tracking-[0.16em] text-muted-foreground uppercase">
+					<Layers size={12} /> 时间阶段记事 {stage ? `${stage.total} 条` : ""} · 已采用 {adopted} 条
+				</p>
 				<Button
 					size="sm"
 					variant="outline"
 					onClick={() => {
-						setCorpus(null);
 						setDraft({ ...blank, region: data.scope?.region ?? "" });
 					}}
 				>
-					<Plus size={14} /> 新增事件
+					<Plus size={14} /> 手工新增
 				</Button>
 			</div>
 
-			{data.candidates.length > 0 && (
-				<section className="flex flex-col gap-1.5">
-					<div className="flex flex-wrap items-center gap-1.5">
-						<h4 className="text-[11px] tracking-[0.16em] text-muted-foreground uppercase">候选 {data.candidates.length}</h4>
-						{/* 按钮只写「全部标记已核对」：批量勾选是人工核对断言，采用仍需逐条确认原文。 */}
-						<Button variant="ghost" size="xs" disabled={candidateUnchecked.length === 0} onClick={() => markChecked(candidateKeys, true)}>
-							全部标记已核对
+			{stage && stage.kinds.length > 0 && (
+				<div className="flex flex-wrap items-center gap-1.5">
+					<Button size="xs" variant={kind === null ? "secondary" : "ghost"} onClick={() => setKind(null)}>
+						全部品性
+					</Button>
+					{stage.kinds.map((item) => (
+						<Button key={item.kind} size="xs" variant={kind === item.kind ? "secondary" : "ghost"} onClick={() => setKind(item.kind === kind ? null : item.kind)}>
+							{item.kind} {item.count}
 						</Button>
-						<Button variant="ghost" size="xs" disabled={candidateChecked.length === 0} onClick={() => markChecked(candidateKeys, false)}>
-							清空
-						</Button>
-					</div>
-					<ul className="flex flex-col gap-1.5">
-						{data.candidates.map((candidate) => {
-							const withinRange = inScope(candidate, data.scope);
-							const key = candidate.sourceKey ?? candidate.title;
-							const verified = checked.has(key);
-							return (
-								<li key={key} className="flex flex-col gap-1.5 rounded-sm border border-border bg-surface px-2.5 py-2">
-									<div className="flex items-start justify-between gap-2">
-										<p className="min-w-0 text-[12.5px] leading-snug text-foreground">{candidate.title}</p>
-										{!withinRange && <Badge variant="warning">超出范围</Badge>}
-									</div>
-									<p className="text-[11px] text-muted-foreground">
-										{candidate.start === candidate.end ? `${candidate.start} 年` : `${candidate.start}—${candidate.end} 年`}
-										{candidate.region ? ` · ${candidate.region}` : ""}
-										{candidate.documentTitle ? ` · 出自《${candidate.documentTitle}》` : ""}
-									</p>
-									{candidate.evidence && (
-										<p className="border-l-2 border-input pl-2 text-[11px] leading-relaxed text-muted-foreground line-clamp-3">
-											{candidate.evidence}
-										</p>
-									)}
-									<div className="flex flex-wrap items-center gap-1.5">
-										<label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-											<Checkbox checked={verified} onCheckedChange={() => toggleChecked(key)} />
-											已核对原文确实支持该事件
-										</label>
-										<Button
-											size="xs"
-											disabled={busy === key || !withinRange || !verified}
-											onClick={() => {
-												void send({ action: "adopt", sourceKey: candidate.sourceKey, confirmed: true }, key).then((ok) => ok && toast.success("已采用该事件。"));
-											}}
-										>
-											{busy === key ? <LoaderCircle size={12} className="animate-spin" /> : <Check size={12} />} 采用
-										</Button>
-										<Button size="xs" variant="ghost" onClick={() => setDraft(toDraft(candidate))}>
-											修改后采用
-										</Button>
-									</div>
-									{!withinRange && (
-										<p className="text-[11px] leading-relaxed text-muted-foreground">
-											活动证据落在当前范围之外。可调整第 01 步的范围，或改写年份后采用。
-										</p>
-									)}
-								</li>
-							);
-						})}
-					</ul>
-				</section>
+					))}
+					<label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+						<Checkbox checked={administrative} onCheckedChange={(value) => setAdministrative(value === true)} />
+						显示除拜赠谥等事务性记事
+					</label>
+				</div>
 			)}
+
+			<div className="sticky top-0 z-10 flex flex-wrap items-center justify-between gap-2 rounded-sm border border-border bg-surface-sunken px-2.5 py-2">
+				<p className="flex items-center gap-1.5 text-[11.5px] text-muted-foreground">
+					<Check size={12} /> 已选 <span className="text-foreground">{selectedCount}</span> 条
+					{selectedCount > 0 && (
+						<>
+							<Users size={12} /> 去重带出 <span className="text-foreground">{brought?.length ?? "…"}</span> 位人物
+							{brought && newPeople > 0 && <span>（新增 {newPeople} 位待核）</span>}
+						</>
+					)}
+				</p>
+				<div className="flex flex-wrap items-center gap-1.5">
+					<Button variant="ghost" size="xs" disabled={selectableUnchecked.length === 0} onClick={() => markChecked(selectableKeys, true)}>
+						全部标记已核对
+					</Button>
+					<Button variant="ghost" size="xs" disabled={selectableChecked.length === 0} onClick={() => markChecked(selectableKeys, false)}>
+						清空
+					</Button>
+					<Button size="xs" disabled={selectedCount === 0 || busy === "adoptMany"} onClick={() => void adoptSelected()}>
+						{busy === "adoptMany" ? <LoaderCircle size={12} className="animate-spin" /> : <Check size={12} />} 采用所选
+					</Button>
+				</div>
+			</div>
+
+			{stage?.note && <p className="text-[11px] leading-relaxed text-warning">{stage.note}</p>}
+			{stage && !stage.ready && (
+				<Alert>
+					<AlertDescription>带年纪事尚未预处理，请在终端执行 npm run corpus:years 后刷新本页。</AlertDescription>
+				</Alert>
+			)}
+
+			{stageBusy ? (
+				<div className="flex flex-col gap-2">
+					<Skeleton className="h-16" />
+					<Skeleton className="h-16" />
+				</div>
+			) : listed.length === 0 ? (
+				<p className="rounded-sm border border-dashed border-input px-3 py-6 text-center text-[12px] text-muted-foreground">
+					该时间阶段没有可列出的史料记事，可换品性类别筛选、显示事务性记事，或手工新增事件。
+				</p>
+			) : (
+				<ul className="flex flex-col gap-1.5">
+					{listed.map((item) => {
+						const verified = checked.has(item.key);
+						const cannotVerify = item.adopted || !item.documentId;
+						return (
+							<li
+								key={item.key}
+								className={`flex flex-col gap-1.5 rounded-sm border px-2.5 py-2 ${verified ? "border-primary/40 bg-surface" : "border-border bg-surface"}`}
+							>
+								<div className="flex items-start justify-between gap-2">
+									<p className="min-w-0 text-[12.5px] leading-snug text-foreground">{item.title}</p>
+									<span className="flex shrink-0 items-center gap-1">
+										{item.adopted && <Badge variant="success">已采用</Badge>}
+										{!item.adopted && item.tier >= 2 && <Badge variant="outline">{tierText[item.tier] ?? "记事"}</Badge>}
+										{!item.documentId && <Badge variant="warning">资料未固定</Badge>}
+									</span>
+								</div>
+								<p className="text-[11px] text-muted-foreground">
+									<span className="text-foreground">{astronomicalToHistorical(item.year)} 年</span>
+									{item.yearLabel ? ` · ${item.yearLabel}` : ""}
+									{item.period ? ` · ${item.period}` : ""} · {item.bookName}·{item.volume}
+								</p>
+								{/* 事件简介＝该条史料记事原文，逐字可核对。 */}
+								<p className="border-l-2 border-input pl-2 text-[11.5px] leading-relaxed text-foreground/90">{item.text}</p>
+								{item.cues.length > 0 && (
+									<div className="flex flex-col gap-1">
+										{item.cues.map((cue) => (
+											<p key={`${cue.kind}-${cue.word}`} className="text-[11px] leading-relaxed text-muted-foreground">
+												<Badge variant="secondary" className="mr-1.5">
+													{cue.kind}
+												</Badge>
+												命中「{cue.word}」
+												{cue.span ? <span className="text-foreground/80"> · {cue.span}</span> : ""}
+											</p>
+										))}
+									</div>
+								)}
+								{item.names.length > 0 && (
+									<div className="flex flex-wrap items-center gap-1">
+										<span className="text-[11px] text-muted-foreground">参与人物</span>
+										{item.names.map((name) => (
+											<Badge key={name} variant={item.missingNames.includes(name) ? "outline" : "secondary"}>
+												{name}
+												{item.missingNames.includes(name) ? "（待建）" : ""}
+											</Badge>
+										))}
+									</div>
+								)}
+								<div className="flex flex-wrap items-center gap-1.5">
+									<label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+										<Checkbox checked={verified} disabled={cannotVerify} onCheckedChange={() => toggleChecked(item.key)} />
+										已核对原文确实支持该事件
+									</label>
+									<Button size="xs" variant="ghost" onClick={() => setDraft(draftFromStage(item, data.scope))}>
+										改写后采用
+									</Button>
+									{item.url && (
+										<a className="text-[11px] text-muted-foreground underline decoration-dotted underline-offset-2" href={item.url} target="_blank" rel="noreferrer">
+											查原文
+										</a>
+									)}
+								</div>
+							</li>
+						);
+					})}
+				</ul>
+			)}
+
+			{stage && listed.length < stage.total && (
+				<Button size="sm" variant="outline" disabled={stageMore} onClick={() => void loadStage({ offset: listed.length })}>
+					{stageMore ? <LoaderCircle size={14} className="animate-spin" /> : <Plus size={14} />} 再载入 {Math.min(pageSize, stage.total - listed.length)} 条
+				</Button>
+			)}
+
+			<Separator />
+
+			<div className="flex items-center justify-between gap-2">
+				<p className="text-[11px] tracking-[0.16em] text-muted-foreground uppercase">本作品已记录 {data.events.length} 条</p>
+				<span className="text-[11px] text-muted-foreground">采用后的事件与人物供第 05 步剧情提案使用</span>
+			</div>
 
 			<section className="flex flex-col gap-1.5">
 				{storedKeys.length > 0 && (
 					<div className="flex flex-wrap items-center gap-1.5">
 						<span className="text-[11px] text-muted-foreground">待核对 {storedKeys.length} 条</span>
-						{/* 与候选列表同一口径：批量标记只写核对状态，采用仍逐条确认。 */}
+						{/* 与记事列表同一口径：批量标记只写核对状态，采用仍逐条确认。 */}
 						<Button variant="ghost" size="xs" disabled={storedUnchecked.length === 0} onClick={() => markChecked(storedKeys, true)}>
 							全部标记已核对
 						</Button>
@@ -388,105 +583,119 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 				)}
 				{data.events.length === 0 ? (
 					<p className="rounded-sm border border-dashed border-input px-3 py-6 text-center text-[12px] text-muted-foreground">
-						还没有事件。先在第 03 步核定人物活动，或直接新增。
+						还没有采用任何事件。在上方时间阶段记事里逐条核对后批量采用。
 					</p>
 				) : (
 					<ul className="flex flex-col gap-1.5">
 						{data.events.map((event) => {
 							const withinRange = inScope(event, data.scope);
 							return (
-							<li key={event.id} className="flex flex-col gap-2 rounded-sm border border-border bg-surface px-2.5 py-2">
-								<div className="flex items-start justify-between gap-2">
-									<p className="min-w-0 text-[12.5px] leading-snug text-foreground">{event.title}</p>
-									<span className="flex shrink-0 items-center gap-1">
-										{event.needsReview && event.status === "adopted" && <Badge variant="warning">待复核</Badge>}
-										<Badge variant={statusVariant[event.status]}>{statusText[event.status]}</Badge>
-									</span>
-								</div>
-								<p className="text-[11px] text-muted-foreground">
-									{event.kind === "historical" ? "历史" : "虚构"} ·{" "}
-									{event.start === event.end ? `${event.start} 年` : `${event.start}—${event.end} 年`}
-									{event.region ? ` · ${event.region}` : ""} · {event.origin === "derived" ? "由证据推导" : "手工记录"}{!withinRange ? " · 超出当前范围" : ""}
-								</p>
-								{event.participants.length > 0 && (
-									<div className="flex flex-wrap gap-1">
-										{event.participants.map((person) => (
-											<Badge key={person.id} variant="secondary">
-												{person.name}
-											</Badge>
-										))}
+								<li key={event.id} className="flex flex-col gap-2 rounded-sm border border-border bg-surface px-2.5 py-2">
+									<div className="flex items-start justify-between gap-2">
+										<p className="min-w-0 text-[12.5px] leading-snug text-foreground">{event.title}</p>
+										<span className="flex shrink-0 items-center gap-1">
+											{event.needsReview && event.status === "adopted" && <Badge variant="warning">待复核</Badge>}
+											<Badge variant={statusVariant[event.status]}>{statusText[event.status]}</Badge>
+										</span>
 									</div>
-								)}
-								{event.evidence && (
-									<p className="border-l-2 border-input pl-2 text-[11px] leading-relaxed text-muted-foreground line-clamp-3">
-										{event.evidence}
+									<p className="text-[11px] text-muted-foreground">
+										{event.kind === "historical" ? "历史" : "虚构"} · {yearLabel(event)}
+										{event.region ? ` · ${event.region}` : ""} · {event.origin === "derived" ? "由史料记事采用" : "手工记录"}
+										{!withinRange ? " · 超出当前范围" : ""}
 									</p>
-								)}
-								<div className="flex flex-wrap items-center gap-1.5">
-									{event.status === "candidate" && (
-										<>
-											<label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-												<Checkbox checked={checked.has(event.id ?? "")} onCheckedChange={() => toggleChecked(event.id ?? "")} />
-												已核对原文
-											</label>
+									{event.summary && <p className="text-[11.5px] leading-relaxed text-foreground/90 line-clamp-3">{event.summary}</p>}
+									{event.reveal && (
+										<p className="text-[11px] leading-relaxed text-muted-foreground">
+											<span className="text-foreground">性格与风貌：</span>
+											{event.reveal}
+										</p>
+									)}
+									{event.cues.length > 0 && (
+										<div className="flex flex-wrap gap-1">
+											{event.cues.map((cue) => (
+												<Badge key={`${cue.kind}-${cue.word}`} variant="secondary">
+													{cue.kind}·{cue.word}
+												</Badge>
+											))}
+										</div>
+									)}
+									{event.participants.length > 0 && (
+										<div className="flex flex-wrap gap-1">
+											{event.participants.map((person) => (
+												<Badge key={person.id} variant="outline">
+													{person.name}
+												</Badge>
+											))}
+										</div>
+									)}
+									{event.evidence && (
+										<p className="border-l-2 border-input pl-2 text-[11px] leading-relaxed text-muted-foreground line-clamp-3">{event.evidence}</p>
+									)}
+									<div className="flex flex-wrap items-center gap-1.5">
+										{event.status === "candidate" && (
+											<>
+												<label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+													<Checkbox checked={checked.has(event.id ?? "")} onCheckedChange={() => toggleChecked(event.id ?? "")} />
+													已核对原文
+												</label>
+												<Button
+													size="xs"
+													disabled={!checked.has(event.id ?? "")}
+													onClick={() => {
+														void (withinRange
+															? send({ action: "update", id: event.id, status: "adopt", confirmed: true }, `adopt-${event.id}`).then((ok) => ok && toast.success("已采用。"))
+															: Promise.resolve(toast.error("事件时间超出当前历史范围，请先编辑年份或调整第 01 步范围。")));
+													}}
+												>
+													<Check size={12} /> 采用
+												</Button>
+											</>
+										)}
+										{event.status === "adopted" && event.needsReview && (
 											<Button
 												size="xs"
-												disabled={!checked.has(event.id ?? "")}
+												variant="outline"
 												onClick={() => {
-													void (withinRange
-														? send({ action: "update", id: event.id, status: "adopt", confirmed: true }, `adopt-${event.id}`).then((ok) => ok && toast.success("已采用。"))
-														: Promise.resolve(toast.error("事件时间超出当前历史范围，请先编辑年份或调整第 01 步范围。")));
+													setVerifyConfirmed(false);
+													setVerifyTarget(event);
 												}}
 											>
-												<Check size={12} /> 采用
+												<ShieldCheck size={12} /> 核对确认
 											</Button>
-										</>
-									)}
-									{event.status === "adopted" && event.needsReview && (
-										<Button
-											size="xs"
-											variant="outline"
-											onClick={() => {
-												setVerifyConfirmed(false);
-												setVerifyTarget(event);
-											}}
-										>
-											<ShieldCheck size={12} /> 核对确认
+										)}
+										{event.status === "adopted" && (
+											<Button
+												size="xs"
+												variant="ghost"
+												onClick={() => {
+													void send({ action: "update", id: event.id, status: "reject" }, `reject-${event.id}`);
+												}}
+											>
+												<Undo2 size={12} /> 排除
+											</Button>
+										)}
+										{event.status === "rejected" && (
+											<Button
+												size="xs"
+												variant="ghost"
+												onClick={() => {
+													void send({ action: "update", id: event.id, status: "restore" }, `restore-${event.id}`);
+												}}
+											>
+												<RotateCcw size={12} /> 恢复
+											</Button>
+										)}
+										<Button size="xs" variant="ghost" onClick={() => setDraft(toDraft(event))}>
+											编辑
 										</Button>
-									)}
-									{event.status === "adopted" && (
 										<Button
 											size="xs"
 											variant="ghost"
+											className="text-destructive"
 											onClick={() => {
-												void send({ action: "update", id: event.id, status: "reject" }, `reject-${event.id}`);
+												void send({ action: "remove", id: event.id }, `remove-${event.id}`).then((ok) => ok && toast.success("事件已删除。"));
 											}}
 										>
-											<Undo2 size={12} /> 排除
-										</Button>
-									)}
-									{event.status === "rejected" && (
-										<Button
-											size="xs"
-											variant="ghost"
-											onClick={() => {
-												void send({ action: "update", id: event.id, status: "restore" }, `restore-${event.id}`);
-											}}
-										>
-											<RotateCcw size={12} /> 恢复
-										</Button>
-									)}
-									<Button size="xs" variant="ghost" onClick={() => setDraft(toDraft(event))}>
-										编辑
-									</Button>
-									<Button
-										size="xs"
-										variant="ghost"
-										className="text-destructive"
-										onClick={() => {
-											void send({ action: "remove", id: event.id }, `remove-${event.id}`).then((ok) => ok && toast.success("事件已删除。"));
-										}}
-									>
 											<Trash2 size={12} /> 删除
 										</Button>
 									</div>
@@ -503,12 +712,11 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 					onOpenChange={(open) => {
 						if (open) return;
 						setDraft(null);
-						setCorpus(null);
 					}}
 				>
 					<DialogContent>
 						<DialogHeader>
-							<DialogTitle>{draft.id ? "编辑事件" : "新增事件"}</DialogTitle>
+							<DialogTitle>{draft.id ? "编辑事件" : draft.sourceKey ? "改写并采用该条记事" : "手工新增事件"}</DialogTitle>
 							<DialogDescription>历史事件需要原文证据；虚构事件单独标记，不改写史实。</DialogDescription>
 						</DialogHeader>
 						<div className="flex flex-col gap-3">
@@ -561,65 +769,8 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 								<Label htmlFor="event-region">区域</Label>
 								<Input id="event-region" maxLength={200} value={draft.region} onChange={(event) => setDraft({ ...draft, region: event.target.value })} />
 							</label>
-							{draft.kind === "historical" && !draft.id && (
-								<div className="flex flex-col gap-2 rounded-sm border border-border bg-surface-sunken/60 p-2.5">
-									<div className="flex items-center justify-between gap-2">
-										<p className="text-[11px] tracking-[0.16em] text-muted-foreground uppercase">史料候选事件</p>
-										<Button
-											size="xs"
-											variant="outline"
-											disabled={corpusBusy || !draft.start || !draft.end}
-											onClick={() => void loadCorpus(draft.start, draft.end)}
-										>
-											{corpusBusy ? <LoaderCircle size={12} className="animate-spin" /> : <Search size={12} />} 按年份查询
-										</Button>
-									</div>
-									<p className="text-[11px] leading-relaxed text-muted-foreground">
-										在已定年的史料记事里检索该区间与已勾选人物（{data.people.filter((person) => person.selected === 1).length} 位）相关的真实事件；候选只是线索，填入后仍需核对原文。
-									</p>
-									{corpus && !corpus.ready && (
-										<Alert>
-											<AlertDescription>带年纪事尚未预处理，请在终端执行 npm run corpus:years 后重新查询。</AlertDescription>
-										</Alert>
-									)}
-									{corpus?.note && <p className="text-[11px] leading-relaxed text-warning">{corpus.note}</p>}
-									{corpus && corpus.ready && corpus.candidates.length === 0 && (
-										<p className="text-[11px] leading-relaxed text-muted-foreground">该区间没有与已勾选人物相关的记事，可改为手工新增。</p>
-									)}
-									{corpus && corpus.candidates.length > 0 && (
-										<ul className="flex max-h-[240px] flex-col gap-1.5 overflow-y-auto pr-1">
-											{corpus.candidates.map((item) => (
-												<li className="flex flex-col gap-1 rounded-sm border border-border bg-surface px-2.5 py-2" key={item.key}>
-													<p className="text-[11px] text-muted-foreground">
-														<span className="text-foreground">{astronomicalToHistorical(item.year)} 年</span>
-														{item.period ? ` · ${item.period}` : ""} · {item.bookName}·{item.volume}
-														{item.names.length > 0 ? ` · ${item.names.join("、")}` : ""}
-													</p>
-													<p className="text-[11.5px] leading-relaxed">{item.text}</p>
-													<div className="flex flex-wrap items-center gap-2">
-														<Button size="xs" disabled={!item.documentId} onClick={() => fillFromCorpus(item)}>
-															填入
-														</Button>
-														{!item.documentId && <span className="text-[11px] text-muted-foreground">该书尚未固定为本项目资料</span>}
-														{item.url && (
-															<a
-																className="text-[11px] text-muted-foreground underline decoration-dotted underline-offset-2"
-																href={item.url}
-																target="_blank"
-																rel="noreferrer"
-															>
-																查原文
-															</a>
-														)}
-													</div>
-												</li>
-											))}
-										</ul>
-									)}
-								</div>
-							)}
 							<label className="flex flex-col gap-1.5">
-								<Label htmlFor="event-summary">本章要写什么</Label>
+								<Label htmlFor="event-summary">事件简介</Label>
 								<Textarea
 									id="event-summary"
 									rows={3}
@@ -629,6 +780,26 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 									onChange={(event) => setDraft({ ...draft, summary: event.target.value })}
 								/>
 							</label>
+							<label className="flex flex-col gap-1.5">
+								<Label htmlFor="event-reveal">该事件体现的性格与精神风貌</Label>
+								<Textarea
+									id="event-reveal"
+									rows={2}
+									maxLength={4000}
+									value={draft.reveal}
+									placeholder="史料里已经写出的是什么，例如：临阵不怯、单骑入营、固辞不受。"
+									onChange={(event) => setDraft({ ...draft, reveal: event.target.value })}
+								/>
+							</label>
+							{draft.cues.length > 0 && (
+								<div className="flex flex-wrap gap-1">
+									{draft.cues.map((cue) => (
+										<Badge key={`${cue.kind}-${cue.word}`} variant="secondary">
+											{cue.kind}·{cue.word}
+										</Badge>
+									))}
+								</div>
+							)}
 							{draft.kind === "historical" && (
 								<div className="flex flex-col gap-2">
 									<Separator />
@@ -731,7 +902,7 @@ export function EventPanel({ projectId, onChanged }: { projectId: string; onChan
 						<div className="flex flex-col gap-3">
 							<p className="text-[12.5px] font-medium text-foreground">{verifyTarget.title}</p>
 							<p className="text-[11px] text-muted-foreground">
-								{verifyTarget.start === verifyTarget.end ? `${verifyTarget.start} 年` : `${verifyTarget.start}—${verifyTarget.end} 年`}
+								{yearLabel(verifyTarget)}
 								{verifyTarget.region ? ` · ${verifyTarget.region}` : ""}
 								{verifyTarget.documentTitle ? ` · 出自《${verifyTarget.documentTitle}》` : ""}
 							</p>

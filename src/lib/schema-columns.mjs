@@ -24,11 +24,21 @@ export const addedColumns = {
 		auto_continuations: 'INTEGER NOT NULL DEFAULT 0',
 	},
 	documents: { corpus_ref: 'TEXT' },
-	characters: { review_status: "TEXT NOT NULL DEFAULT 'confirmed'" },
+	characters: {
+		review_status: "TEXT NOT NULL DEFAULT 'confirmed'",
+		// 性格与精神风貌由事件所带出的品性线索生成，profile_source 记录是人工写的还是模型写的待核稿。
+		personality: "TEXT NOT NULL DEFAULT ''",
+		temperament: "TEXT NOT NULL DEFAULT ''",
+		profile_source: "TEXT NOT NULL DEFAULT ''",
+	},
 	historical_relations: { review_status: "TEXT NOT NULL DEFAULT 'confirmed'" },
 	plot_events: {
 		needs_review: 'INTEGER NOT NULL DEFAULT 0',
 		verified_at: 'TEXT',
+		// 该事件体现的人物性格与精神风貌（含史料线索句），不是人物之间的对抗关系。
+		reveal: "TEXT NOT NULL DEFAULT ''",
+		// 采用时定位到的品性线索，原文可核对：类别／命中词／所在句片段。
+		reveal_cues: "TEXT NOT NULL DEFAULT '[]'",
 	},
 	reference_novel: { volume_order: 'INTEGER NOT NULL DEFAULT 0' },
 }

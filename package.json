@@ -11,6 +11,7 @@
     "corpus:persons": "node scripts/index-corpus-persons.mjs",
     "corpus:years": "node scripts/index-corpus-years.mjs",
     "corpus:check": "node scripts/check-corpus.mjs",
+    "cues:tune": "node scripts/tune-character-cues.mjs",
     "lint": "eslint .",
     "ebooks:convert": "data/local/tools/mobi-venv/bin/python scripts/convert-mobi.py",
     "trial:reference": "node scripts/analyze-reference-trial.mjs",
@@ -20,7 +21,8 @@
     "test:auto": "node scripts/test-corpus-auto.mjs",
     "test:chain": "node scripts/test-creation-chain.mjs",
     "test:regen": "node scripts/test-regenerate.mjs",
-    "test:outline-groups": "node scripts/test-outline-groups.mjs"
+    "test:outline-groups": "node scripts/test-outline-groups.mjs",
+    "test:event-first": "node scripts/test-event-first.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",

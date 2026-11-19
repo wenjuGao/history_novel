@@ -3,7 +3,7 @@ import 'server-only'
 import OpenAI from 'openai'
 import { BAILIAN_MODELS, getBailianConfiguration, type BailianModelId } from '@/lib/bailian'
 import { billingMode } from '@/lib/bailian-endpoint.mjs'
-import { buildGenerationContext, outlineEvidence, projectScope } from '@/lib/plot-events'
+import { adoptedEvidenceEvents, buildGenerationContext, outlineEvidence, outlineEvidenceCap, projectScope } from '@/lib/plot-events'
 import { MAX_PLAN_CHAPTERS, OUTLINE_GROUP_SIZE } from '@/lib/plan-limits'
 import { proposalGateReason, stampProposal } from '@/lib/proposal-binding'
 import { activeReferenceSpec } from '@/lib/reference-spec'
@@ -20,8 +20,37 @@ export const outlineSystemPrompt =
 const chapterOutputBudget = 1100
 const groupOutputFloor = 1000
 
+/** 每章按 4 条证据折算容量：实测 60 条证据写到第 10 章就用尽，之后只能复用或编造。 */
+const eventsPerChapter = 4
+
+/** 年代倒回容差：允许同一年多章与少量回溯铺垫，用来拦住后续组整组退回开头重写。 */
+const yearRegressionTolerance = 5
+
 export function groupMaxOutputTokens(chaptersInGroup: number) {
 	return Math.min(20_000, groupOutputFloor + chapterOutputBudget * Math.max(1, chaptersInGroup))
+}
+
+/** 输出被截断时的缩减梯度：一组从 10 章逐级降到 1 章，同时按梯度重算 max_tokens。 */
+export function groupShrinkSizes(chaptersInGroup: number): number[] {
+	return [...new Set([chaptersInGroup, 5, 3, 1])]
+		.map((size) => Math.min(size, chaptersInGroup))
+		.filter((size) => size >= 1)
+		.filter((size, index, sizes) => sizes.indexOf(size) === index)
+		.sort((left, right) => right - left)
+}
+
+/**
+ * 中文约 1 token/字、ASCII 约 4 字/token。
+ * 早先用 UTF-8 字节数折算，中文一段三字节约估成三倍，实测 11,449 token 被报成 37,742。
+ */
+export function estimateTokens(text: string) {
+	let cjk = 0
+	let other = 0
+	for (const char of text) {
+		if (/[㐀-䶿一-鿿豈-﫿぀-ヿ가-힯＀-￯]/.test(char)) cjk += 1
+		else other += 1
+	}
+	return cjk + Math.ceil(other / 4)
 }
 
 /** 计划章数折算出的调用组数；章数为 0 或非法时按 1 组算，具体校验在调用方。 */
@@ -46,7 +75,7 @@ export function specGateReason(projectId: string) {
 
 export function outlineBlockReason(projectId: string) {
 	if (!projectScope(projectId)) return '请先在第 01 步设定历史范围。'
-	if (!outlineEvidence(projectId).length) return '请先在第 04 步采用至少一个带原文证据的历史事件。'
+	if (!outlineEvidence(projectId).length) return '请先在第 03 步采用至少一个带原文证据的历史事件。'
 	const specBlocked = specGateReason(projectId)
 	if (specBlocked) return specBlocked
 	// REQ-056：章纲步骤只接受已选定的剧情提案，重生成或史实变化后必须重新选定。
@@ -64,7 +93,7 @@ export type OutlineEstimate = {
 
 export function estimateFor(userPrompt: string, mode: string, modelId: string, outputTokens = groupMaxOutputTokens(OUTLINE_GROUP_SIZE)): OutlineEstimate {
 	const prices = BAILIAN_MODELS[modelId as BailianModelId] ?? BAILIAN_MODELS[outlineModelId]
-	const inputTokenAllowance = Buffer.byteLength(outlineSystemPrompt + userPrompt, 'utf8') + 1024
+	const inputTokenAllowance = estimateTokens(outlineSystemPrompt + userPrompt) + 1024
 	return {
 		billingMode: mode,
 		modelId,
@@ -76,6 +105,67 @@ export function estimateFor(userPrompt: string, mode: string, modelId: string, o
 				? null
 				: (inputTokenAllowance * prices.inputPricePerMillion + outputTokens * prices.outputPricePerMillion) / 1_000_000,
 	}
+}
+
+export type OutlineCapacity = {
+	/** 已采用且带原文证据、已人工核对的历史事件总数。 */
+	evidenceTotal: number
+	/** 实际进入请求的条数：超出 outlineEvidenceCap 时按年代均匀取样。 */
+	evidenceSent: number
+	evidenceCap: number
+	coveredStartYear: number | null
+	coveredEndYear: number | null
+	scopeStartYear: number | null
+	scopeEndYear: number | null
+	/** 按每章 eventsPerChapter 条证据折算的章数上限。 */
+	suggestedChapters: number
+	overCapacity: boolean
+	note: string
+}
+
+/** 证据容量：把「计划章数是否撑得起」在点按钮之前就算出来，而不是等最后一组作废。 */
+export function outlineCapacity(projectId: string, plannedChapters?: number): OutlineCapacity {
+	const scope = projectScope(projectId)
+	const evidenceTotal = adoptedEvidenceEvents(projectId).length
+	const sent = outlineEvidence(projectId)
+	const years = sent.map(({ event }) => event.start)
+	const suggestedChapters = Math.max(1, Math.floor(sent.length / eventsPerChapter))
+	const coveredStartYear = years.length ? Math.min(...years) : null
+	const coveredEndYear = years.length ? Math.max(...years) : null
+	const parts: string[] = []
+	if (sent.length < evidenceTotal) {
+		parts.push(`已采用 ${evidenceTotal} 条证据，入请求 ${sent.length} 条（超过 ${outlineEvidenceCap} 条按年代均匀取样）`)
+	} else {
+		parts.push(`可用证据 ${sent.length} 条`)
+	}
+	parts.push(
+		coveredEndYear === null
+			? '没有可作为依据的已采用事件'
+			: `证据年代 ${coveredStartYear}—${coveredEndYear}，作品范围 ${scope?.startYear ?? '—'}—${scope?.endYear ?? '—'}${
+					scope && coveredEndYear < scope.endYear ? `，${coveredEndYear} 年之后没有可用依据` : ''
+				}`,
+	)
+	parts.push(`按每章 ${eventsPerChapter} 条约可支撑 ${suggestedChapters} 章`)
+	const requested = Number.isInteger(plannedChapters) ? (plannedChapters as number) : null
+	return {
+		evidenceTotal,
+		evidenceSent: sent.length,
+		evidenceCap: outlineEvidenceCap,
+		coveredStartYear,
+		coveredEndYear,
+		scopeStartYear: scope?.startYear ?? null,
+		scopeEndYear: scope?.endYear ?? null,
+		suggestedChapters,
+		overCapacity: requested !== null && requested > suggestedChapters,
+		note: `${parts.join('；')}。`,
+	}
+}
+
+/** 超出容量时的拦截语；界面可用 overrideCapacity 明确越过后继续。 */
+export function capacityBlockReason(projectId: string, plannedChapters: number): string | null {
+	const capacity = outlineCapacity(projectId, plannedChapters)
+	if (!capacity.overCapacity) return null
+	return `${capacity.note}计划 ${plannedChapters} 章会在第 ${capacity.suggestedChapters + 1} 章起失去可引依据，模型只能把前面写过的事件重新编排或编造史实。请补采用事件、把计划章数降到 ${capacity.suggestedChapters} 章以内，或勾选「已知证据不足，仍按计划章数生成」。`
 }
 
 export function outlinePayload(projectId: string, plannedChapters: number) {
@@ -125,6 +215,8 @@ export type OutlineGroupRequest = {
 	accumulated?: Chapter[]
 	/** 第一组产出的整本设定；缺省表示本次就是第一组。 */
 	book?: OutlineBookFrame | null
+	/** 本组最多写几章；输出被截断时按 groupShrinkSizes 逐级缩小后重发。 */
+	groupSize?: number
 }
 
 export type OutlineGroupResult = {
@@ -137,22 +229,50 @@ export type OutlineGroupResult = {
 	usage: OutlineUsage | null
 	requestId: string | null
 	done: boolean
+	/** 本组产出后已达成的内容级检查（重复章题、证据重复编排、年代倒回），逐组就报不等最后一组。 */
+	warnings: string[]
+	/** 未引用过的证据已用尽：再调用只会让模型倒回前面重写，界面据此停下并成稿。 */
+	noEvidenceLeft: boolean
 }
 
-export function outlineGroupPayload(projectId: string, { plannedChapters, from, accumulated = [], book = null }: OutlineGroupRequest) {
-	const to = Math.min(plannedChapters, from + OUTLINE_GROUP_SIZE - 1)
+/** 证据编号到起始年份的映射：年代推进与倒回检查都以它为准。 */
+function evidenceYearById(projectId: string) {
+	return new Map(outlineEvidence(projectId).map(({ id, event }) => [id, event.start]))
+}
+
+export function outlineGroupPayload(projectId: string, { plannedChapters, from, accumulated = [], book = null, groupSize = OUTLINE_GROUP_SIZE }: OutlineGroupRequest) {
+	const to = Math.min(plannedChapters, from + groupSize - 1)
 	const previous = accumulated.at(-1)
+	const yearById = evidenceYearById(projectId)
+	const allIds = [...yearById.keys()]
+	const usedIds = [...new Set(accumulated.flatMap((chapter) => chapter.historyEvidence))]
+	const usedSet = new Set(usedIds)
+	const unusedEvidenceIds = allIds.filter((id) => !usedSet.has(id))
+	const usedYears = usedIds.map((id) => yearById.get(id)).filter((year): year is number => typeof year === 'number')
+	const writtenThroughYear = usedYears.length ? Math.max(...usedYears) : null
 	return {
 		...outlinePayload(projectId, plannedChapters),
-		range: { from, to, totalChapters: plannedChapters, groupSize: OUTLINE_GROUP_SIZE, generatedBefore: accumulated.length },
+		range: { from, to, totalChapters: plannedChapters, groupSize, generatedBefore: accumulated.length },
 		book,
+		// 分组续写只回传上一章钩子时，模型会把时间顺序理解为「从 E1 再数一遍」，实测第 2 组整组重写第 1 组。
+		continuation: {
+			usedEvidenceIds: usedIds,
+			unusedEvidenceIds,
+			writtenThroughYear,
+			writtenChapterTitles: accumulated.map((chapter) => chapter.title),
+			recentChapters: accumulated.slice(-3).map((chapter) => ({ id: chapter.id, title: chapter.title, historyEvidence: chapter.historyEvidence })),
+		},
 		// 只带上衔接需要的字段：钩子与末章依据的证据编号，避免后续组把整份旧文当成新章节抄回来。
 		previousChapter: previous
 			? { id: previous.id, title: previous.title, synopsis: previous.synopsis, endingHook: previous.endingHook, historyEvidence: previous.historyEvidence }
 			: null,
-		instructions: `按已采用事件的时间顺序编排章节；每章只承担一个主要冲突，跨事件可合并。本次只输出第 ${from} 至 ${to} 章（全书计划 ${plannedChapters} 章，此前已编排 ${accumulated.length} 章），不要输出范围外的章节。${
-			previous ? `上一章《${previous.title}》的章末钩子是「${previous.endingHook}」，本章要接上它而不是复述它。` : ''
-		}`,
+		instructions: `按已采用事件的时间顺序编排章节；每章只承担一个主要冲突，跨事件可合并。本次只输出第 ${from} 至 ${to} 章（全书计划 ${plannedChapters} 章，此前已编排 ${accumulated.length} 章），不要输出范围外的章节，也不得重复已有章题。${
+			accumulated.length
+				? `此前已经引用的证据编号见 continuation.usedEvidenceIds，本组只能从 continuation.unusedEvidenceIds 中取材，并且必须从 ${
+						writtenThroughYear === null ? '已写章节之后' : `${writtenThroughYear} 年之后`
+					} 往前接续，不得再次引用用过的编号。剩余证据不足以写满本组时，只写有依据的章节并少交几章，不要复用旧事件或编造史实。`
+				: ''
+		}${previous ? `上一章《${previous.title}》的章末钩子是「${previous.endingHook}」，本章要接上它而不是复述它。` : ''}`,
 	}
 }
 
@@ -194,6 +314,59 @@ export function unknownEvidenceIds(plan: StoryPlan, projectId: string) {
 	return [...new Set([...anchors, ...citations])]
 }
 
+/**
+ * 内容级检查：结构校验全绿但章纲重复，是这次线上「生成成功却不可用」的真实形态。
+ * 三项都在全书章节列表上做，因此逐组调用也能提前发现后续组倒回重写。
+ */
+export function chapterFlowIssues(chapters: readonly Chapter[], projectId: string): string[] {
+	const issues: string[] = []
+	if (!chapters.length) return issues
+
+	const titleHits = new Map<string, string[]>()
+	for (const chapter of chapters) {
+		const key = chapter.title.replace(/\s+/g, '').toLowerCase()
+		if (!key) continue
+		titleHits.set(key, [...(titleHits.get(key) ?? []), chapter.id])
+	}
+	const duplicatedTitles = [...titleHits.values()].filter((ids) => ids.length > 1)
+	if (duplicatedTitles.length) {
+		const listed = duplicatedTitles.slice(0, 6).map((ids) => ids.join('＝')).join('、')
+		issues.push(`存在重复章题：${listed}${duplicatedTitles.length > 6 ? ` 等 ${duplicatedTitles.length} 组` : ''}。`)
+	}
+
+	const citedBy = new Map<string, string[]>()
+	chapters.forEach((chapter, index) => {
+		for (const id of chapter.historyEvidence) citedBy.set(id, [...(citedBy.get(id) ?? []), String(index + 1)])
+	})
+	const reused = [...citedBy.entries()].filter(([, positions]) => new Set(positions).size > 1)
+	if (reused.length && reused.length / citedBy.size > 0.2) {
+		const listed = reused
+			.slice(0, 8)
+			.map(([id, positions]) => `${id}（第 ${[...new Set(positions)].join('、')} 章）`)
+			.join('；')
+		issues.push(`同一证据被多章重复编排：${listed}${reused.length > 8 ? ` 等 ${reused.length} 条` : ''}，占已引用证据的 ${Math.round((reused.length / citedBy.size) * 100)}%。`)
+	}
+
+	const yearById = evidenceYearById(projectId)
+	let writtenThrough = Number.NEGATIVE_INFINITY
+	const regressions: string[] = []
+	for (const chapter of chapters) {
+		const years = chapter.historyEvidence.map((id) => yearById.get(id)).filter((year): year is number => typeof year === 'number')
+		if (!years.length) continue
+		const earliest = Math.min(...years)
+		if (Number.isFinite(writtenThrough) && earliest + yearRegressionTolerance < writtenThrough) {
+			regressions.push(`${chapter.id}（回到 ${earliest} 年，此前已写到 ${writtenThrough} 年）`)
+		}
+		writtenThrough = Math.max(writtenThrough, ...years)
+	}
+	if (regressions.length) {
+		issues.push(
+			`章节年代倒回：${regressions.slice(0, 5).join('、')}${regressions.length > 5 ? ` 等 ${regressions.length} 章` : ''}；通常是后续组已无可引证据，请补采用事件或以已生成章节成稿。`,
+		)
+	}
+	return issues
+}
+
 export function outlineIssues(plan: StoryPlan, projectId: string) {
 	const issues: string[] = []
 	if (!plan.chapters.length) issues.push('模型没有返回任何章节。')
@@ -201,7 +374,24 @@ export function outlineIssues(plan: StoryPlan, projectId: string) {
 	if (!validPlan(plan)) issues.push('大纲结构未通过本地校验。')
 	const unknown = unknownEvidenceIds(plan, projectId)
 	if (unknown.length) issues.push(`大纲引用了不存在的证据编号：${unknown.join('、')}。`)
+	issues.push(...chapterFlowIssues(plan.chapters, projectId))
 	return issues
+}
+
+/** 不拦保存但必须让作者看见的缺口：证据没写到范围末尾、整本锚点为空、有章完全没有引用。 */
+export function outlineWarnings(plan: StoryPlan, projectId: string): string[] {
+	const warnings: string[] = []
+	const scope = projectScope(projectId)
+	const yearById = evidenceYearById(projectId)
+	const citedYears = plan.chapters.flatMap((chapter) => chapter.historyEvidence.map((id) => yearById.get(id)).filter((year): year is number => typeof year === 'number'))
+	if (scope && citedYears.length) {
+		const lastYear = Math.max(...citedYears)
+		if (lastYear < scope.endYear) warnings.push(`章纲依据只写到 ${lastYear} 年，作品范围到 ${scope.endYear} 年；之后的章节没有史料锚点，需人工核定或明确标为虚构。`)
+	}
+	if (!(plan.historicalAnchors ?? []).length) warnings.push('整本史实锚点（historicalAnchors）为空，请补写或重新生成。')
+	const uncited = plan.chapters.filter((chapter) => !chapter.historyEvidence.length).map((chapter) => chapter.id)
+	if (uncited.length) warnings.push(`存在没有证据引用的章节：${uncited.slice(0, 8).join('、')}${uncited.length > 8 ? ` 等 ${uncited.length} 章` : ''}。`)
+	return warnings
 }
 
 /** 章节按位置重编号并逐字段裁剪：分组续写时模型偶尔重复编号或跳号，位置式编号保证全书 id 唯一。 */
@@ -264,6 +454,8 @@ export type OutlineUsage = { promptTokens: number | null; completionTokens: numb
 export type OutlineGeneration = {
 	plan: StoryPlan
 	issues: string[]
+	/** 不拦保存的缺口提示：证据年代没写到范围末尾、整本锚点为空、有章没有引用。 */
+	warnings: string[]
 	accepted: boolean
 	estimate: OutlineEstimate
 	usage: OutlineUsage | null
@@ -296,6 +488,18 @@ function addUsage(total: OutlineUsage | null, next: OutlineUsage | null): Outlin
 	}
 }
 
+/** 第一组的整本设定为准，但空字段用后续组补齐：锚点为空时只取第一组会让它永远补不回来。 */
+function healFrame(book: OutlineBookFrame, fresh: OutlineBookFrame): OutlineBookFrame {
+	return {
+		title: book.title,
+		synopsis: book.synopsis || fresh.synopsis,
+		centralQuestion: book.centralQuestion || fresh.centralQuestion,
+		historicalAnchors: book.historicalAnchors.length ? book.historicalAnchors : fresh.historicalAnchors,
+		fictionBoundary: book.fictionBoundary.length ? book.fictionBoundary : fresh.fictionBoundary,
+		humanReviewQuestions: book.humanReviewQuestions.length ? book.humanReviewQuestions : fresh.humanReviewQuestions,
+	}
+}
+
 /**
  * 单组章纲：一次模型调用只写本组的章节，返回已裁剪的章节与整本设定。
  * 界面按组串行调用，因此中断时已生成章节仍留在浏览器里，不会写入任何规划。
@@ -314,49 +518,87 @@ export async function generateOutlineGroup(projectId: string, request: OutlineGr
 	const modelId = configuration.writingModel
 	const accumulated = request.accumulated ?? []
 	const from = Math.min(Math.max(1, Math.trunc(request.from) || 1), plannedChapters)
-	const to = Math.min(plannedChapters, from + OUTLINE_GROUP_SIZE - 1)
-	const payload = outlineGroupPayload(projectId, { plannedChapters, from, accumulated, book: request.book ?? null })
-	const userPrompt = JSON.stringify(payload)
-	const estimate = estimateFor(userPrompt, mode, modelId, groupMaxOutputTokens(to - from + 1))
-
+	const requestedSize = Math.min(plannedChapters, from + (request.groupSize ?? OUTLINE_GROUP_SIZE) - 1) - from + 1
+	const sizes = groupShrinkSizes(requestedSize)
 	const client = new OpenAI({ apiKey: configuration.apiKey, baseURL: configuration.baseURL, maxRetries: 0, timeout: 600_000 })
-	let completion: OpenAI.Chat.Completions.ChatCompletion
-	try {
-		completion = await client.chat.completions.create({
-			model: configuration.writingModel,
-			messages: [
-				{ role: 'system', content: outlineSystemPrompt },
-				{ role: 'user', content: userPrompt },
-			],
-			max_tokens: estimate.maxOutputTokens,
-			temperature: 0.6,
-			response_format: { type: 'json_object' },
-			enable_thinking: false,
-		} as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming & { enable_thinking: boolean })
-	} catch (error) {
-		throw new OutlineError(
-			error instanceof OpenAI.APIError
-				? `大纲生成失败：HTTP ${error.status}；未写入任何规划。`
-				: '大纲生成请求状态未知；未写入任何规划，请先核对百炼请求记录。',
-			502,
-		)
+
+	for (const [attempt, size] of sizes.entries()) {
+		const payload = outlineGroupPayload(projectId, { plannedChapters, from, accumulated, book: request.book ?? null, groupSize: size })
+		const userPrompt = JSON.stringify(payload)
+		const estimate = estimateFor(userPrompt, mode, modelId, groupMaxOutputTokens(size))
+		let completion: OpenAI.Chat.Completions.ChatCompletion
+		try {
+			completion = await client.chat.completions.create({
+				model: configuration.writingModel,
+				messages: [
+					{ role: 'system', content: outlineSystemPrompt },
+					{ role: 'user', content: userPrompt },
+				],
+				max_tokens: estimate.maxOutputTokens,
+				temperature: 0.6,
+				response_format: { type: 'json_object' },
+				enable_thinking: false,
+			} as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming & { enable_thinking: boolean })
+		} catch (error) {
+			// 上游的 message 与 request_id 都要透出来，否则界面只剩一个 HTTP 状态码，分不清是配额、参数还是内容审核。
+			const apiError = error instanceof OpenAI.APIError ? error : null
+			const detail =
+				typeof apiError?.error?.message === 'string' && apiError.error.message.trim()
+					? apiError.error.message.trim().slice(0, 240)
+					: apiError
+						? String(apiError.message).slice(0, 240)
+						: null
+			const upstreamRequestId = apiError?.requestID ?? null
+			throw new OutlineError(
+				apiError
+					? `大纲生成失败：HTTP ${apiError.status}${detail ? `；${detail}` : ''}${upstreamRequestId ? `；request_id ${upstreamRequestId}` : ''}；未写入任何规划。`
+					: '大纲生成请求状态未知；未写入任何规划，请先核对百炼请求记录。',
+				502,
+			)
+		}
+
+		const finishReason = completion.choices[0]?.finish_reason ?? null
+		const content = completion.choices[0]?.message?.content ?? ''
+		if (finishReason === 'length' || (finishReason === null && !content.trim())) {
+			// 只有明确的长度截断才降组重发；最后一档仍截断就报出来，不把半截 JSON 说成「模型没返回 JSON」。
+			if (attempt < sizes.length - 1) continue
+			throw new OutlineError(`第 ${from} 章起的输出被 max_tokens 截断，已按 ${sizes.join('→')} 章缩减仍不完整；未写入任何规划。`, 502)
+		}
+
+		let parsed: Partial<StoryPlan>
+		try {
+			parsed = parseModelJson(content) as Partial<StoryPlan>
+		} catch (error) {
+			if (error instanceof OutlineError && attempt < sizes.length - 1) continue
+			throw error
+		}
+
+		// 第一组的整本设定生效；后续组回传原设定，避免同一本书每次调用换一个书名与梗概。
+		const fresh = bookFrame(parsed)
+		const frame = request.book ? healFrame(request.book, fresh) : fresh
+		const chapters = sanitizeChapters(Array.isArray(parsed.chapters) ? parsed.chapters : [], size).map((chapter, index) => ({
+			...chapter,
+			id: `chapter-${String(from + index).padStart(2, '0')}`,
+		}))
+		const merged = [...accumulated, ...chapters]
+		const citedIds = new Set(merged.flatMap((chapter) => chapter.historyEvidence))
+		const unusedLeft = outlineEvidence(projectId).filter(({ id }) => !citedIds.has(id)).length
+		return {
+			from,
+			to: from + chapters.length - 1,
+			groups: outlineGroupCount(plannedChapters),
+			chapters,
+			book: frame,
+			estimate,
+			usage: usageOf(completion.usage ?? undefined, modelId, configuration.billingMode),
+			requestId: completion.id ?? null,
+			done: merged.length >= plannedChapters,
+			warnings: chapterFlowIssues(merged, projectId),
+			noEvidenceLeft: unusedLeft === 0 && merged.length < plannedChapters,
+		}
 	}
 
-	const parsed = parseModelJson(completion.choices[0]?.message?.content ?? '') as Partial<StoryPlan>
-	// 第一组的整本设定生效；后续组回传原设定，避免同一本书每次调用换一个书名与梗概。
-	const frame = request.book ?? bookFrame(parsed)
-	const chapters = sanitizeChapters(Array.isArray(parsed.chapters) ? parsed.chapters : [], to - from + 1)
-	return {
-		from,
-		to,
-		groups: outlineGroupCount(plannedChapters),
-		chapters: chapters.map((chapter, index) => ({ ...chapter, id: `chapter-${String(from + index).padStart(2, '0')}` })),
-		book: frame,
-		estimate,
-		usage: usageOf(completion.usage ?? undefined, modelId, configuration.billingMode),
-		requestId: completion.id ?? null,
-		done: accumulated.length + chapters.length >= plannedChapters,
-	}
+	throw new OutlineError(`第 ${from} 章起的分组生成未能完成；未写入任何规划。`, 502)
 }
 
 /** 合并已生成章节为整本规划（用于逐组生成完成后或中途止笔时成稿）。 */
@@ -367,7 +609,7 @@ export function mergeOutlinePlan(projectId: string, request: OutlineGroupRequest
 	if (!chapters.length) throw new OutlineError('还没有任何已生成的章节，无法成稿。', 409)
 	const plan = outlineFromFrame(projectId, frame, chapters, chapters.length)
 	const issues = outlineIssues(plan, projectId)
-	return { plan, issues, accepted: !issues.length }
+	return { plan, issues, warnings: outlineWarnings(plan, projectId), accepted: !issues.length }
 }
 
 export async function generateOutline(projectId: string, { plannedChapters = 8 }: { plannedChapters?: number } = {}): Promise<OutlineGeneration> {
@@ -382,22 +624,25 @@ export async function generateOutline(projectId: string, { plannedChapters = 8 }
 	let estimate: OutlineEstimate | null = null
 	let usage: OutlineUsage | null = null
 	let requestId: string | null = null
+	let warnings: string[] = []
 
 	for (let call = 0; accumulated.length < plannedChapters && call < maxCalls; call += 1) {
 		const result = await generateOutlineGroup(projectId, { plannedChapters, from: accumulated.length + 1, accumulated, book: frame })
 		if (!result.chapters.length) throw new OutlineError(`模型没有返回第 ${result.from} 章起的章节；未写入任何规划。`)
 		accumulated = [...accumulated, ...result.chapters]
 		frame = result.book
+		warnings = result.warnings
 		estimate = estimate ? mergeEstimates(estimate, result.estimate) : result.estimate
 		usage = addUsage(usage, result.usage)
 		requestId = result.requestId
-		if (result.done) break
+		// 证据用尽后再调用只会让模型倒回前面重写，因此按已有章节直接成稿。
+		if (result.done || result.noEvidenceLeft) break
 	}
 
 	if (!frame || !estimate) throw new OutlineError('模型没有返回任何章节。')
 	const plan = outlineFromFrame(projectId, frame, accumulated, plannedChapters)
 	const issues = outlineIssues(plan, projectId)
-	return { plan, issues, accepted: !issues.length, estimate, usage, requestId }
+	return { plan, issues, warnings: [...new Set([...warnings, ...outlineWarnings(plan, projectId)])], accepted: !issues.length, estimate, usage, requestId }
 }
 
 function mergeEstimates(total: OutlineEstimate, next: OutlineEstimate): OutlineEstimate {

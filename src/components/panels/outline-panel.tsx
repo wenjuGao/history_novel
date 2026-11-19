@@ -18,6 +18,17 @@ type OutlineState = {
 	proposalIssue: string | null;
 	proposalBlocked: boolean;
 	evidence: Array<{ id: string; title: string }>;
+	capacity?: {
+		evidenceTotal: number;
+		evidenceSent: number;
+		evidenceCap: number;
+		coveredStartYear: number | null;
+		coveredEndYear: number | null;
+		scopeStartYear: number | null;
+		scopeEndYear: number | null;
+		suggestedChapters: number;
+		note: string;
+	} | null;
 	model: string;
 	billingMode: string;
 	configured: boolean;
@@ -25,7 +36,7 @@ type OutlineState = {
 	reference: { series: string; specChars: number; drift: string | null } | null;
 };
 type Preview = { estimate: { inputTokenAllowance: number; maxOutputTokens: number; tokenAllowance: number; ceilingCny: number | null }; groups?: number };
-type Generated = { plan: StoryPlan; issues: string[]; accepted: boolean; usage: { promptTokens: number | null; completionTokens: number | null } | null };
+type Generated = { plan: StoryPlan; issues: string[]; warnings: string[]; accepted: boolean; usage: { promptTokens: number | null; completionTokens: number | null } | null };
 type PlanChapter = StoryPlan["chapters"][number];
 type BookFrame = Pick<StoryPlan, "title" | "synopsis" | "centralQuestion" | "historicalAnchors" | "fictionBoundary" | "humanReviewQuestions">;
 type GroupUsage = { promptTokens: number | null; completionTokens: number | null } | null | undefined;
@@ -34,13 +45,24 @@ type GroupResponse = {
 	book?: BookFrame | null;
 	plan?: StoryPlan;
 	issues?: string[];
+	warnings?: string[];
 	accepted?: boolean;
 	usage?: GroupUsage;
 	generated?: number;
 	groups?: number;
+	noEvidenceLeft?: boolean;
 };
 /** 逐组生成的中间态：已生成章节只留在浏览器里，某组失败或作者停笔都不丢。 */
-type GroupRun = { planned: number; chapters: PlanChapter[]; book: BookFrame | null; calls: number; usage: { promptTokens: number; completionTokens: number } | null };
+type GroupRun = {
+	planned: number;
+	chapters: PlanChapter[];
+	book: BookFrame | null;
+	calls: number;
+	usage: { promptTokens: number; completionTokens: number } | null;
+	warnings: string[];
+	/** 服务端判定证据已用尽：继续调用只会让模型倒回前面重写。 */
+	evidenceExhausted: boolean;
+};
 
 /** 计划章数折算的调用组数：每组最多 OUTLINE_GROUP_SIZE 章。 */
 function groupTotal(planned: number) {
@@ -72,6 +94,8 @@ export function OutlinePanel({ projectId, onSaved }: { projectId: string; onSave
 	const [failed, setFailed] = useState("");
 	// 逐组生成的进度：计划章数不限制，每 OUTLINE_GROUP_SIZE 章一次调用，界面上能看到第几组与已生成章数。
 	const [run, setRun] = useState<GroupRun | null>(null);
+	// 证据容量不足时作者可以明确越过拦截继续按计划章数生成（服务端逐组复核，默认不发请求）。
+	const [overrideCapacity, setOverrideCapacity] = useState(false);
 	const stopRun = useRef(false);
 
 	const load = useCallback(async () => {
@@ -131,7 +155,7 @@ export function OutlinePanel({ projectId, onSaved }: { projectId: string; onSave
 	async function finalizeRun(current: GroupRun) {
 		const result = await postGroup({ action: "finalize", plannedChapters: current.planned, accumulated: current.chapters, book: current.book });
 		if (!result.plan) throw new Error("服务端未返回可保存的章纲。");
-		setDraft({ plan: result.plan, issues: result.issues ?? [], accepted: result.accepted !== false, usage: current.usage });
+		setDraft({ plan: result.plan, issues: result.issues ?? [], warnings: result.warnings ?? [], accepted: result.accepted !== false, usage: current.usage });
 		setRun(null);
 		toast.success(`已用生成的 ${current.chapters.length} 章组成章纲，检查后再保存。`);
 	}
@@ -142,10 +166,14 @@ export function OutlinePanel({ projectId, onSaved }: { projectId: string; onSave
 		setBusy("generate");
 		setFailed("");
 		setDraft(null);
-		let current: GroupRun = start ? { ...start } : { planned: Number(plannedChapters), chapters: [], book: null, calls: 0, usage: null };
+		let current: GroupRun = start
+			? { ...start }
+			: { planned: Number(plannedChapters), chapters: [], book: null, calls: 0, usage: null, warnings: [], evidenceExhausted: false };
 		setRun(current);
+		// 少给的组允许比组数多补几轮，但要有上限：模型持续少交时界面会一直花 Token。
+		const maxCalls = groupTotal(current.planned) * 2 + 2;
 		try {
-			while (current.chapters.length < current.planned) {
+			while (current.chapters.length < current.planned && !current.evidenceExhausted && current.calls < maxCalls) {
 				const result = await postGroup({
 					action: "generate-group",
 					plannedChapters: current.planned,
@@ -153,6 +181,7 @@ export function OutlinePanel({ projectId, onSaved }: { projectId: string; onSave
 					accumulated: current.chapters,
 					book: current.book,
 					allowExternalTransfer: true,
+					overrideCapacity,
 				});
 				const produced = result.chapters ?? [];
 				current = {
@@ -161,17 +190,27 @@ export function OutlinePanel({ projectId, onSaved }: { projectId: string; onSave
 					book: current.book ?? result.book ?? null,
 					calls: current.calls + 1,
 					usage: addUsage(current.usage, result.usage),
+					warnings: [...new Set([...current.warnings, ...(result.warnings ?? [])])],
+					evidenceExhausted: result.noEvidenceLeft === true,
 				};
 				setRun(current);
 				// 补齐计划章数的那一次调用直接返回整本规划，界面随即进入既有的检查—保存流程。
 				if (result.plan) {
-					setDraft({ plan: result.plan, issues: result.issues ?? [], accepted: result.accepted !== false, usage: current.usage });
+					setDraft({ plan: result.plan, issues: result.issues ?? [], warnings: result.warnings ?? [], accepted: result.accepted !== false, usage: current.usage });
 					setRun(null);
 					toast.success(`${result.plan.chapters.length} 章章纲已生成，检查后再保存。`);
 					return;
 				}
 				if (!produced.length) throw new Error(`模型没有返回第 ${current.chapters.length + 1} 章起的章节，请先核对已采用事件是否足够。`);
 				if (stopRun.current) break;
+			}
+			if (current.chapters.length && current.chapters.length < current.planned) {
+				const why = current.evidenceExhausted
+					? "可用证据已用尽，再调用会让模型倒回前面重写"
+					: current.calls >= maxCalls
+						? "补齐轮次已达上限"
+						: "已按要求停笔";
+				toast.warning(`${why}：按已生成的 ${current.chapters.length} 章成稿，需要更多章节请先在第 03 步补采用事件。`, { duration: 12000 });
 			}
 			if (current.chapters.length) await finalizeRun(current);
 		} catch (cause) {
@@ -221,11 +260,23 @@ export function OutlinePanel({ projectId, onSaved }: { projectId: string; onSave
 	const chaptersReady = Number.isInteger(chapters) && chapters >= 1 && chapters <= MAX_PLAN_CHAPTERS;
 	const groupCount = groupTotal(chapters);
 	const tokenPlan = state.billingMode === "token-plan";
+	const capacity = state.capacity ?? null;
+	// 章数超过证据折算容量：服务端会拦下每一组调用，这里先给出建议章数与越过入口。
+	const overCapacity = Boolean(capacity && chaptersReady && chapters > capacity.suggestedChapters);
 
 	return (
 		<section className="flex flex-col gap-3" aria-label="大纲生成">
 			<div className="flex flex-wrap items-center gap-2">
-				<Badge variant={state.evidence.length ? "success" : "warning"}>{state.evidence.length} 条证据</Badge>
+				<Badge variant={state.evidence.length ? "success" : "warning"}>
+					{capacity && capacity.evidenceSent < capacity.evidenceTotal
+						? `${capacity.evidenceSent}/${capacity.evidenceTotal} 条证据入请求`
+						: `${state.evidence.length} 条证据`}
+				</Badge>
+				{capacity && (
+					<Badge variant={overCapacity ? "warning" : "outline"}>
+						证据约可支撑 {capacity.suggestedChapters} 章
+					</Badge>
+				)}
 				<Badge variant="outline">{state.model}</Badge>
 				<Badge variant="outline">{tokenPlan ? "Token Plan" : "按量计费"}</Badge>
 				{state.plan && <Badge variant={state.plan.origin === "local" ? "warning" : "success"}>{`v${state.plan.version} ${originLabels[state.plan.origin]} · ${state.plan.chapters} 章`}</Badge>}
@@ -282,6 +333,37 @@ export function OutlinePanel({ projectId, onSaved }: { projectId: string; onSave
 					<p className="text-[11px] leading-relaxed text-muted-foreground">
 						大纲只依据已采用的事件与其原文证据编排；预览不发送任何内容到模型，生成前会显示完整外发内容与用量上限。
 					</p>
+					{/* 容量提示：证据能支撑的章数在点按钮之前就算好，避免跑到最后一组才发现整本不可用。 */}
+					{capacity?.coveredEndYear && capacity.scopeEndYear !== null && capacity.coveredEndYear < capacity.scopeEndYear && (
+						<Alert>
+							<AlertDescription className="flex flex-col gap-2">
+								<p>{capacity.note}</p>
+								<p>
+									已采用事件的年代只到 {capacity.coveredEndYear} 年，而范围要求到 {capacity.scopeEndYear} 年；{capacity.coveredEndYear} 年之后的章节没有任何可引依据。
+								</p>
+								<Button asChild size="xs" variant="outline" className="w-fit">
+									<Link href={`/projects/${projectId}/setup/events`}>去第 03 步补采用历史事件</Link>
+								</Button>
+							</AlertDescription>
+						</Alert>
+					)}
+					{overCapacity && (
+						<Alert variant="destructive">
+							<AlertDescription className="flex flex-col gap-2">
+								<p>
+									计划 {chapters} 章超出证据可支撑的 {capacity?.suggestedChapters ?? 0} 章；服务端会在每次分组调用前拦下，不发送任何内容。
+								</p>
+								<label className="flex items-start gap-2 text-[12px] leading-relaxed">
+									<Checkbox
+										className="mt-0.5"
+										checked={overrideCapacity}
+										onCheckedChange={(value) => setOverrideCapacity(value === true)}
+									/>
+									已知证据不足，仍按计划章数生成（后续组会复用已写事件或写成明确虚构，成稿后需逐章核对）。
+								</label>
+							</AlertDescription>
+						</Alert>
+					)}
 					<div className="flex items-end gap-2">
 						<label className="flex flex-col gap-1.5">
 							<Label htmlFor="outline-chapters">计划章节数</Label>
@@ -356,7 +438,7 @@ export function OutlinePanel({ projectId, onSaved }: { projectId: string; onSave
 					<div className="flex flex-wrap items-center gap-2">
 						<Button
 							size="sm"
-							disabled={busy !== null || !allowExternalTransfer || !state.configured || !chaptersReady}
+							disabled={busy !== null || !allowExternalTransfer || !state.configured || !chaptersReady || (overCapacity && !overrideCapacity)}
 							onClick={() => void generateGroups()}
 						>
 							{busy === "generate" ? <LoaderCircle size={14} className="animate-spin" /> : <Sparkles size={14} />}
@@ -379,6 +461,19 @@ export function OutlinePanel({ projectId, onSaved }: { projectId: string; onSave
 					{run && (
 						<div className="flex flex-wrap items-center gap-2 rounded-sm border border-border bg-surface-sunken/60 px-2.5 py-2 text-[11px] leading-relaxed text-muted-foreground">
 							<span>{`第 ${Math.min(Math.floor(run.chapters.length / OUTLINE_GROUP_SIZE) + 1, groupTotal(run.planned))} / ${groupTotal(run.planned)} 组 · 已生成 ${run.chapters.length} / ${run.planned} 章 · 已调用 ${run.calls} 次`}</span>
+							{run.evidenceExhausted && (
+								<span className="text-destructive">可用证据已用尽：继续调用会让模型倒回前面重写，请按已生成章数成稿。</span>
+							)}
+							{/* 逐组就报内容级信号（重复章题、证据重复编排、年代倒回），不必等最后一组才发现整本重复。 */}
+							{run.warnings.length > 0 && (
+								<ul className="w-full basis-full list-disc pl-4">
+									{run.warnings.slice(0, 6).map((warning) => (
+										<li key={warning} className="text-destructive">
+											{warning}
+										</li>
+									))}
+								</ul>
+							)}
 							{busy === null && run.chapters.length > 0 && (
 								<>
 									<Button size="xs" variant="ghost" disabled={!allowExternalTransfer || !state.configured} onClick={() => void generateGroups(run)}>
@@ -418,6 +513,14 @@ export function OutlinePanel({ projectId, onSaved }: { projectId: string; onSave
 						</Alert>
 					) : (
 						<p className="text-[11px] text-success">结构与证据编号校验通过。</p>
+					)}
+					{/* 成稿级的内容提示：不拦保存，但要点开逐章核对（证据覆盖断档、年代锚缺失等）。 */}
+					{draft.warnings.length > 0 && (
+						<ul className="list-disc pl-4 text-[11px] leading-relaxed text-warning">
+							{draft.warnings.map((warning) => (
+								<li key={warning}>{warning}</li>
+							))}
+						</ul>
 					)}
 					<div className="flex items-center gap-2">
 						<Button size="sm" disabled={busy !== null || !draft.accepted} onClick={() => void saveDraft()}>
